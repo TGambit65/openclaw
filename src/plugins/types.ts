@@ -314,6 +314,7 @@ export type PluginHookName =
   | "before_message_write"
   | "session_start"
   | "session_end"
+  | "session_before_end"
   | "gateway_start"
   | "gateway_stop";
 
@@ -547,6 +548,13 @@ export type PluginHookSessionEndEvent = {
   durationMs?: number;
 };
 
+// session_before_end hook
+export type PluginHookSessionBeforeEndEvent = {
+  sessionId: string;
+  reason: "new" | "reset" | "compact" | "auto";
+  messageCount: number;
+};
+
 // Gateway context
 export type PluginHookGatewayContext = {
   port?: number;
@@ -631,6 +639,10 @@ export type PluginHookHandlerMap = {
   ) => Promise<void> | void;
   session_end: (
     event: PluginHookSessionEndEvent,
+    ctx: PluginHookSessionContext,
+  ) => Promise<void> | void;
+  session_before_end: (
+    event: PluginHookSessionBeforeEndEvent,
     ctx: PluginHookSessionContext,
   ) => Promise<void> | void;
   gateway_start: (
