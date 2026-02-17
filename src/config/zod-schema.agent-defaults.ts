@@ -11,6 +11,7 @@ import {
   CliBackendSchema,
   HumanDelaySchema,
 } from "./zod-schema.core.js";
+import { GuardModelConfigSchema } from "./zod-schema.providers-core.js";
 
 export const AgentDefaultsSchema = z
   .object({
@@ -148,6 +149,7 @@ export const AgentDefaultsSchema = z
       .optional(),
     heartbeat: HeartbeatSchema,
     maxConcurrent: z.number().int().positive().optional(),
+    guardModel: GuardModelConfigSchema.optional(),
     subagents: z
       .object({
         maxConcurrent: z.number().int().positive().optional(),
