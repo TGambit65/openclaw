@@ -11,6 +11,19 @@ metadata:
 
 Use **bash** (with optional background mode) for all coding agent work. Simple and effective.
 
+## Prompt Contract (Required Before Spawn)
+
+Before starting any coding agent, define this contract in the prompt:
+
+1. **Objective** (what outcome is required)
+2. **Scope** (exact files/areas allowed)
+3. **Out of scope** (what must not change)
+4. **Preservation rule** (preserve existing content unless explicitly told to replace)
+5. **Success criteria + validation commands**
+6. **Risk level** (low/medium/high) + rollback note for medium/high
+
+If intent or success criteria are ambiguous, ask clarifying questions before spawning.
+
 ## ⚠️ PTY Mode Required!
 
 Coding agents (Codex, Claude Code, Pi) are **interactive terminal applications** that need a pseudo-terminal (PTY) to work correctly. Without PTY, you'll get broken output, missing colors, or the agent may hang.
@@ -251,6 +264,14 @@ When you spawn coding agents in the background, keep the user in the loop.
 This prevents the user from seeing only "Agent failed before reply" and having no idea what happened.
 
 ---
+
+## Autonomous Background Mode (Default)
+
+Default behavior: hand off with a complete prompt contract, run in background, and avoid babysitting loops.
+
+- Don’t live-poll unless there is a blocker or explicit user request.
+- Report only milestone changes, blockers, and completion.
+- Always include final verification output (build/test/lint/manual checks as applicable).
 
 ## Auto-Notify on Completion
 
