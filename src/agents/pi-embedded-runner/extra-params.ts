@@ -173,6 +173,23 @@ function createOpenRouterHeadersWrapper(baseStreamFn: StreamFn | undefined): Str
 }
 
 /**
+ * Create a streamFn wrapper that adds a User-Agent header identifying as a
+ * coding agent, required by Kimi's kimi-for-coding model which only accepts
+ * requests from recognized coding agent clients (Claude Code, Kilo Code, etc).
+ */
+function createKimiHeadersWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+  const underlying = baseStreamFn ?? streamSimple;
+  return (model, context, options) =>
+    underlying(model, context, {
+      ...options,
+      headers: {
+        "User-Agent": "claude-code/1.0",
+        ...options?.headers,
+      },
+    });
+}
+
+/**
  * Create a streamFn wrapper that injects tool_stream=true for Z.AI providers.
  *
  * Z.AI's API supports the `tool_stream` parameter to enable real-time streaming
@@ -240,6 +257,11 @@ export function applyExtraParamsToAgent(
   if (provider === "openrouter") {
     log.debug(`applying OpenRouter app attribution headers for ${provider}/${modelId}`);
     agent.streamFn = createOpenRouterHeadersWrapper(agent.streamFn);
+  }
+
+  if (provider === "kimi") {
+    log.debug(`applying Kimi coding-agent User-Agent header for ${provider}/${modelId}`);
+    agent.streamFn = createKimiHeadersWrapper(agent.streamFn);
   }
 
   // Enable Z.AI tool_stream for real-time tool call streaming.
