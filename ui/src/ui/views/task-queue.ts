@@ -1,5 +1,5 @@
 import { html, nothing } from "lit";
-import { formatAgo } from "../format.ts";
+import { formatRelativeTimestamp as formatAgo } from "../format.ts";
 import type { TaskQueueSnapshot } from "../types.ts";
 
 const DEFAULT_COLUMNS = [

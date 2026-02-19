@@ -5,7 +5,7 @@ import type {
   SwarmAgentNode,
   SwarmGroup,
 } from "../controllers/swarm.ts";
-import { formatAgo } from "../format.ts";
+import { formatRelativeTimestamp as formatAgo } from "../format.ts";
 
 export type SwarmViewProps = {
   loading: boolean;
