@@ -91,6 +91,11 @@ const BASE_METHODS = [
   "mesh.status",
   "mesh.retry",
   "browser.request",
+  "taskQueue.list",
+  "swarm.list",
+  "swarm.hierarchy",
+  "trust.profile",
+  "trust.log",
   // WebChat WebSocket-native chat methods
   "chat.history",
   "chat.abort",

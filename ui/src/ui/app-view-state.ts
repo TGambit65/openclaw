@@ -30,6 +30,7 @@ import type {
   SessionsListResult,
   SkillStatusReport,
   StatusSummary,
+  TaskQueueSnapshot,
 } from "./types.ts";
 import type { ChatAttachment, ChatQueueItem, CronFormState } from "./ui-types.ts";
 import type { NostrProfileFormState } from "./views/channels.nostr-profile-form.ts";
@@ -221,6 +222,13 @@ export type AppViewState = {
   logsLimit: number;
   logsMaxBytes: number;
   logsAtBottom: boolean;
+  taskQueueLoading: boolean;
+  taskQueueSnapshot: TaskQueueSnapshot | null;
+  taskQueueError: string | null;
+  swarmLoading: boolean;
+  swarmSnapshot: import("./controllers/swarm.ts").SwarmSnapshot | null;
+  swarmHierarchy: import("./controllers/swarm.ts").SwarmHierarchy | null;
+  swarmError: string | null;
   client: GatewayBrowserClient | null;
   refreshSessionsAfterChat: Set<string>;
   connect: () => void;
@@ -268,6 +276,8 @@ export type AppViewState = {
   handleLoadSkills: () => Promise<void>;
   handleLoadDebug: () => Promise<void>;
   handleLoadLogs: () => Promise<void>;
+  handleLoadTaskQueue: () => Promise<void>;
+  handleLoadSwarm: () => Promise<void>;
   handleDebugCall: () => Promise<void>;
   handleRunUpdate: () => Promise<void>;
   setPassword: (next: string) => void;
