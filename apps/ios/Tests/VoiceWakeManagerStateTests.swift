@@ -62,4 +62,15 @@ import Testing
         try? await Task.sleep(nanoseconds: 300_000_000)
         #expect(await capture.value == "hello")
     }
+
+    @Test @MainActor func suppressingForTalkPausesListening() {
+        let manager = VoiceWakeManager()
+        manager.isEnabled = true
+        manager.isListening = true
+        manager.statusText = "Listening"
+
+        manager.setSuppressedByTalk(true)
+        #expect(manager.isListening == false)
+        #expect(manager.statusText == "Paused")
+    }
 }

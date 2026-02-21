@@ -145,6 +145,7 @@ final class TalkModeManager: NSObject {
     func start() async {
         guard self.isEnabled else { return }
         guard self.captureMode != .pushToTalk else { return }
+        self.normalizeListeningStateForStart()
         if self.isListening { return }
         guard self.gatewayConnected else {
             self.statusText = "Offline"
@@ -183,6 +184,13 @@ final class TalkModeManager: NSObject {
             self.isListening = false
             self.statusText = "Start failed: \(error.localizedDescription)"
             self.logger.error("start failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func normalizeListeningStateForStart() {
+        if self.isListening, (self.recognitionTask == nil || !self.audioEngine.isRunning) {
+            self.logger.warning("stale listening state detected; resetting")
+            self.isListening = false
         }
     }
 
@@ -575,11 +583,17 @@ final class TalkModeManager: NSObject {
                     }
                 }
                 self.logger.debug("speech recognition error: \(msg, privacy: .public)")
+                // Always reset the recognizer so we don't stay "listening" with a dead task.
+                self.stopRecognition()
+                if self.captureMode == .pushToTalk {
+                    Task { @MainActor [weak self] in
+                        _ = await self?.cancelPushToTalk()
+                    }
+                    return
+                }
                 // Speech recognition can terminate on transient errors (e.g. no speech detected).
                 // If talk mode is enabled and we're in continuous capture, try to restart.
                 if self.captureMode == .continuous, self.isEnabled, !self.isSpeaking {
-                    // Treat the task as terminal on error so we don't get stuck with a dead recognizer.
-                    self.stopRecognition()
                     Task { @MainActor [weak self] in
                         await self?.restartRecognitionAfterError()
                     }
@@ -625,6 +639,7 @@ final class TalkModeManager: NSObject {
         self.recognitionTask = nil
         self.recognitionRequest?.endAudio()
         self.recognitionRequest = nil
+        self.isListening = false
         self.micLevel = 0
         self.lastAudioActivity = nil
         self.noiseFloorSamples.removeAll(keepingCapacity: true)
@@ -2122,6 +2137,16 @@ extension TalkModeManager {
 
     func _test_incrementalIngest(_ text: String, isFinal: Bool) -> [String] {
         self.incrementalSpeechBuffer.ingest(text: text, isFinal: isFinal)
+    }
+
+    func _test_markListeningStale() {
+        self.isListening = true
+        self.recognitionTask = nil
+        self.audioEngine.stop()
+    }
+
+    func _test_normalizeListeningStateForStart() {
+        self.normalizeListeningStateForStart()
     }
 }
 #endif
