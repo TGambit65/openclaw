@@ -25,7 +25,7 @@ This page explains hardening **within that model**. It does not claim hostile mu
 
 ## Quick check: `openclaw security audit`
 
-See also: [Formal Verification (Security Models)](/security/formal-verification/)
+See also: [Formal Verification (Security Models)](/security/formal-verification/) · [Telegram Allowlists & Group Controls — Remediation Checklist](/gateway/security/telegram-allowlist-remediation-checklist)
 
 Run this regularly (especially after changing config or exposing network surfaces):
 
