@@ -252,6 +252,42 @@ This prevents the user from seeing only "Agent failed before reply" and having n
 
 ---
 
+## Default Spawn Contract (Required)
+
+For every coding-agent run, include these fields explicitly in the prompt:
+
+1. **Intent mode**: `build | verify | refactor | diagnose`
+2. **Objective**: single concrete outcome
+3. **Scope allowed**: exact files/dirs the agent may touch
+4. **Out-of-scope**: explicit forbidden edits
+5. **Artifacts required**: commit hash + changed files + verification output
+6. **Done criteria**: observable pass conditions
+7. **Escalation rule**: stop and report blockers rather than guessing
+
+Use this compact template:
+
+```text
+Intent: <build|verify|refactor|diagnose>
+Objective: <one sentence>
+Scope: <paths>
+Out-of-scope: <paths/rules>
+Validation: <commands>
+Deliverables: commit hash, changed files, test/lint output
+If blocked: stop and print BLOCKED + reason + next action
+```
+
+## Context Pack Discipline
+
+Before spawning, attach only the minimum relevant context:
+
+- active task file / checklist
+- 1-2 key source files
+- latest decision log for the feature
+
+Avoid loading broad workspace context unless required; this reduces drift and token burn.
+
+---
+
 ## Auto-Notify on Completion
 
 For long-running background tasks, append a wake trigger to your prompt so OpenClaw gets notified immediately when the agent finishes (instead of waiting for the next heartbeat):
