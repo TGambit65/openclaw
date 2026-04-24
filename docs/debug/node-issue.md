@@ -45,6 +45,7 @@ node --import tsx scripts/repro/tsx-name-repro.ts
 
 - Node 25.3.0: fails
 - Node 22.22.0 (Homebrew `node@22`): fails
+- Node 22.22.0 on Linux: fails with the same `createSubsystemLogger` → `internal-hooks` stack shown above
 - Node 24: not installed here yet; needs verification
 
 ## Notes / hypothesis
@@ -69,6 +70,7 @@ node --import tsx scripts/repro/tsx-name-repro.ts
   ```
 
 - Confirmed locally: `pnpm exec tsc -p tsconfig.json` + `node openclaw.mjs status` works on Node 25.
+- Fresh worktrees without build output cannot use that fallback until `dist/entry.(m)js` exists; otherwise `node openclaw.mjs status` exits with `openclaw: missing dist/entry.(m)js (build output).`
 - Disable esbuild keepNames in the TS loader if possible (prevents `__name` helper insertion); tsx does not currently expose this.
 - Test Node LTS (22/24) with `tsx` to see if the issue is Node 25–specific.
 
