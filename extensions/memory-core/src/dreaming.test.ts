@@ -2531,7 +2531,11 @@ describe("short-term dreaming trigger", () => {
     const narrativeMessages = [{ role: "assistant", content: "A diary entry." }];
     const subagent = {
       run: vi.fn(async (_params: { model?: string }) => ({ runId: "narrative-run-1" })),
+      resolveOwnerSession: vi.fn(async () => ({ status: "unknown" as const })),
       waitForRun: vi.fn(async () => ({ status: "ok" as const })),
+      getRecoveryOwnership: vi.fn(async () => ({ status: "unknown" as const })),
+      getRunState: vi.fn(async () => ({ status: "unknown" as const })),
+      requireCompletionDelivery: vi.fn(async () => ({ status: "unknown" as const })),
       getSessionMessages: vi.fn(async () => ({
         messages: narrativeMessages,
       })),

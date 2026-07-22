@@ -7,7 +7,7 @@ import {
   type WorkboardWorktreeRuntime,
 } from "./dispatcher.js";
 import type { WorkboardStore } from "./store.js";
-import type { WorkboardCard } from "./types.js";
+import type { WorkboardCard, WorkboardRequesterOrigin } from "./types.js";
 
 const ADMIN_SCOPE = "operator.admin";
 const WRITE_SCOPE = "operator.write";
@@ -16,6 +16,7 @@ type WorkboardCommandApi = {
   runtime: {
     subagent: WorkboardSubagentRuntime;
     worktrees: WorkboardWorktreeRuntime;
+    tasks: Pick<OpenClawPluginApi["runtime"]["tasks"], "managedFlows">;
   };
 };
 
@@ -86,6 +87,10 @@ export async function handleWorkboardCommand(params: {
   args?: string;
   senderIsOwner?: boolean;
   gatewayClientScopes?: readonly string[];
+  requesterSessionKey?: string;
+  requesterOrigin?: WorkboardRequesterOrigin;
+  requesterWorkspace?: string;
+  onReconciliationNeeded?: () => Promise<void> | void;
 }): Promise<{ text: string; isError?: boolean }> {
   const [action = "list", ...rest] = splitArgs(params.args);
   if (action === "help") {
@@ -121,7 +126,12 @@ export async function handleWorkboardCommand(params: {
     if (!title) {
       return { text: "Usage: /workboard create <title>", isError: true };
     }
-    const card = await params.store.create({ title });
+    const card = await params.store.create({
+      title,
+      ...(params.requesterSessionKey ? { requesterSessionKey: params.requesterSessionKey } : {}),
+      ...(params.requesterOrigin ? { requesterOrigin: params.requesterOrigin } : {}),
+      ...(params.requesterWorkspace ? { requesterWorkspace: params.requesterWorkspace } : {}),
+    });
     return { text: `Created ${card.id.slice(0, 8)} ${card.title}` };
   }
   if (action === "dispatch") {
@@ -132,13 +142,20 @@ export async function handleWorkboardCommand(params: {
     const result = await dispatchAndStartWorkboardCards({
       store: params.store,
       subagent: params.api.runtime.subagent,
+      managedFlows: params.api.runtime.tasks.managedFlows,
       worktrees: params.api.runtime.worktrees,
       options: {
         allowManagedWorktrees: params.gatewayClientScopes
           ? params.gatewayClientScopes.includes(ADMIN_SCOPE)
           : params.senderIsOwner === true,
+        requesterSessionKey: params.requesterSessionKey,
+        requesterOrigin: params.requesterOrigin,
+        requesterWorkspace: params.requesterWorkspace,
       },
     });
+    if (result.needsReconciliation) {
+      await params.onReconciliationNeeded?.();
+    }
     return {
       text: [
         `dispatch: started=${result.started.length} failures=${result.startFailures.length} promoted=${result.promoted.length} blocked=${result.blocked.length}`,
@@ -155,6 +172,7 @@ export async function handleWorkboardCommand(params: {
 export function registerWorkboardCommand(params: {
   api: OpenClawPluginApi;
   store: WorkboardStore;
+  onReconciliationNeeded?: () => Promise<void> | void;
 }): void {
   params.api.registerCommand({
     name: "workboard",
@@ -168,6 +186,18 @@ export function registerWorkboardCommand(params: {
         args: ctx.args,
         senderIsOwner: ctx.senderIsOwner,
         gatewayClientScopes: ctx.gatewayClientScopes,
+        requesterSessionKey: ctx.sessionKey,
+        requesterWorkspace: ctx.workspaceDir,
+        requesterOrigin:
+          ctx.channel && (ctx.from || ctx.to)
+            ? {
+                channel: ctx.channel,
+                to: ctx.from ?? ctx.to,
+                accountId: ctx.accountId,
+                threadId: ctx.messageThreadId,
+              }
+            : undefined,
+        onReconciliationNeeded: params.onReconciliationNeeded,
       }),
   });
 }

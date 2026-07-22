@@ -5,6 +5,7 @@ import type { CallGatewayOptions } from "../gateway/call.js";
 import { SUBAGENT_KILL_TASK_ERROR } from "../tasks/detached-task-runtime-contract.js";
 import {
   buildAnnounceIdFromChildRun,
+  buildAnnounceIdFromCompletionObligation,
   buildAnnounceIdempotencyKey,
 } from "./announce-idempotency.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
@@ -210,6 +211,7 @@ async function runNoReplyMirrorScenario(params: {
   text?: string;
   idempotencyKey?: string;
   idempotencyKeyForEntry?: (entry: SubagentRunRecord) => string;
+  obligationId?: string;
 }): Promise<SubagentRunRecord> {
   // A failed direct announce can still be mirrored from the requester history;
   // the idempotency key prevents stale or unrelated assistant text from winning.
@@ -217,6 +219,14 @@ async function runNoReplyMirrorScenario(params: {
     endedAt: 4_000,
     expectsCompletionMessage: true,
     retainAttachmentsOnKeep: true,
+    ...(params.obligationId
+      ? {
+          delivery: {
+            status: "pending" as const,
+            obligationId: params.obligationId,
+          },
+        }
+      : {}),
   });
   const text = params.text ?? "final completion reply";
   const idempotencyKey =
@@ -264,6 +274,28 @@ async function runNoReplyMirrorScenario(params: {
 }
 
 describe("subagent registry lifecycle hardening", () => {
+  it("uses a stable verified-obligation announce id distinct from a prior generic result", () => {
+    const generic = buildAnnounceIdFromChildRun({
+      childSessionKey: "agent:main:subagent:child",
+      childRunId: "run-1",
+    });
+    const verified = buildAnnounceIdFromCompletionObligation({
+      childSessionKey: "agent:main:subagent:child",
+      childRunId: "run-1",
+      obligationId: "workboard:card-1:completion",
+    });
+    const retried = buildAnnounceIdFromCompletionObligation({
+      childSessionKey: "agent:main:subagent:child",
+      childRunId: "run-1",
+      obligationId: "workboard:card-1:completion",
+    });
+
+    expect(verified).not.toBe(generic);
+    expect(retried).toBe(verified);
+    expect(verified).not.toContain("workboard:card-1:completion");
+    expect(buildAnnounceIdempotencyKey(retried)).toBe(buildAnnounceIdempotencyKey(verified));
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     taskExecutorMocks.completeTaskRunByRunId.mockReset();
@@ -2750,6 +2782,28 @@ describe("subagent registry lifecycle hardening", () => {
     expect(entry.delivery?.payload).toBeUndefined();
     expect(entry.delivery?.attemptCount).toBeUndefined();
     expect(hasDeliveredTaskStatusUpdate(entry.runId)).toBe(true);
+    expect(helperMocks.logAnnounceGiveUp).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    gatewayMocks.callGateway.mockResolvedValue({});
+    const obligationId = "workboard:card-1:completion";
+    const verifiedMirrorEntry = await runNoReplyMirrorScenario({
+      timestamp: 12_345,
+      obligationId,
+      idempotencyKeyForEntry: (candidate) =>
+        `${buildAnnounceIdempotencyKey(
+          buildAnnounceIdFromCompletionObligation({
+            childSessionKey: candidate.childSessionKey,
+            childRunId: candidate.runId,
+            obligationId,
+          }),
+        )}:internal-source-reply:0`,
+    });
+
+    await vi.waitFor(() => expect(verifiedMirrorEntry.cleanupCompletedAt).toBeTypeOf("number"));
+    expect(verifiedMirrorEntry.delivery?.deliveredAt).toBe(12_345);
+    expect(verifiedMirrorEntry.delivery?.announcedAt).toBe(12_345);
+    expect(hasDeliveredTaskStatusUpdate(verifiedMirrorEntry.runId)).toBe(true);
     expect(helperMocks.logAnnounceGiveUp).not.toHaveBeenCalled();
 
     vi.clearAllMocks();

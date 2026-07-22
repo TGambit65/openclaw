@@ -1,12 +1,15 @@
 // Workboard plugin module implements gateway behavior.
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { OpenClawPluginApi } from "../api.js";
+import type { WorkboardCompletionCoordinator } from "./completion-delivery.js";
 import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
+import { redactWorkboardCardForExternalView } from "./redaction.js";
 import { WorkboardStore } from "./store.js";
-import { WORKBOARD_STATUSES, type WorkboardCard } from "./types.js";
+import { WORKBOARD_STATUSES, type WorkboardCard, type WorkboardManagedFlowView } from "./types.js";
 
 const READ_SCOPE = "operator.read" as const;
 const WRITE_SCOPE = "operator.write" as const;
+const CANONICAL_MAIN_OWNER_MODE = "canonical_main_no_origin" as const;
 
 type GatewayMethodContext = Parameters<
   Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]
@@ -36,6 +39,36 @@ function readPatch(params: Record<string, unknown>): Record<string, unknown> {
   return params;
 }
 
+const MANAGED_WORKFLOW_PROJECTION_KEYS = new Set([
+  "requesterSessionKey",
+  "requesterOwnerMode",
+  "requesterOrigin",
+  "requesterWorkspace",
+  "flowId",
+  "flowOwnerSessionKey",
+  "flowRevision",
+  "controllerId",
+  "completionDelivery",
+]);
+
+function assertNoManagedWorkflowProjection(value: unknown): void {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      assertNoManagedWorkflowProjection(entry);
+    }
+    return;
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (MANAGED_WORKFLOW_PROJECTION_KEYS.has(key)) {
+      throw new Error(`${key} is reserved for the trusted Workboard workflow runtime.`);
+    }
+    assertNoManagedWorkflowProjection(entry);
+  }
+}
+
 function assertNoCursorAdvance(params: Record<string, unknown>) {
   if (params.advance === true) {
     throw new Error("notification cursor advancement requires workboard.notifications.advance.");
@@ -43,17 +76,7 @@ function assertNoCursorAdvance(params: Record<string, unknown>) {
 }
 
 function redactClaimToken(card: WorkboardCard): WorkboardCard {
-  const claim = card.metadata?.claim;
-  if (!claim) {
-    return card;
-  }
-  return {
-    ...card,
-    metadata: {
-      ...card.metadata,
-      claim: { ...claim, token: "[redacted]" },
-    },
-  };
+  return redactWorkboardCardForExternalView(card);
 }
 
 function redactDiagnosticsRows(result: Awaited<ReturnType<WorkboardStore["diagnostics"]>>) {
@@ -69,9 +92,14 @@ function redactDiagnosticsRows(result: Awaited<ReturnType<WorkboardStore["diagno
 export function registerWorkboardGatewayMethods(params: {
   api: OpenClawPluginApi;
   store?: WorkboardStore;
+  onReconciliationNeeded?: () => Promise<void> | void;
+  completeCard?: WorkboardCompletionCoordinator;
+  readManagedFlow?: (card: WorkboardCard) => WorkboardManagedFlowView | undefined;
 }) {
   const { api } = params;
   const store = params.store ?? WorkboardStore.openSqlite();
+  const completeCard =
+    params.completeCard ?? (async (id, input, scope) => await store.complete(id, input, scope));
 
   api.registerGatewayMethod(
     "workboard.cards.list",
@@ -92,6 +120,7 @@ export function registerWorkboardGatewayMethods(params: {
     "workboard.cards.create",
     async ({ params: requestParams, respond }) => {
       try {
+        assertNoManagedWorkflowProjection(requestParams);
         respond(true, { card: redactClaimToken(await store.create(requestParams)) });
       } catch (error) {
         respondError(respond, error);
@@ -104,6 +133,7 @@ export function registerWorkboardGatewayMethods(params: {
     "workboard.cards.update",
     async ({ params: requestParams, respond }) => {
       try {
+        assertNoManagedWorkflowProjection(readPatch(requestParams));
         respond(true, {
           card: redactClaimToken(
             await store.update(readId(requestParams), readPatch(requestParams)),
@@ -307,7 +337,7 @@ export function registerWorkboardGatewayMethods(params: {
     async ({ params: requestParams, respond }) => {
       try {
         respond(true, {
-          card: redactClaimToken(await store.complete(readId(requestParams), requestParams, null)),
+          card: redactClaimToken(await completeCard(readId(requestParams), requestParams, null)),
         });
       } catch (error) {
         respondError(respond, error);
@@ -348,6 +378,7 @@ export function registerWorkboardGatewayMethods(params: {
     "workboard.cards.bulk",
     async ({ params: requestParams, respond }) => {
       try {
+        assertNoManagedWorkflowProjection(requestParams.patch);
         const result = await store.bulkUpdate(requestParams);
         respond(true, { cards: result.cards.map(redactClaimToken) });
       } catch (error) {
@@ -385,21 +416,62 @@ export function registerWorkboardGatewayMethods(params: {
     "workboard.cards.dispatch",
     async ({ params: requestParams, respond, client }) => {
       try {
+        assertNoManagedWorkflowProjection(requestParams);
         const boardId =
           requestParams && typeof requestParams === "object" && "boardId" in requestParams
             ? requestParams.boardId
             : undefined;
+        const ownerMode =
+          requestParams && typeof requestParams === "object" && "ownerMode" in requestParams
+            ? requestParams.ownerMode
+            : undefined;
+        if (ownerMode !== undefined && ownerMode !== CANONICAL_MAIN_OWNER_MODE) {
+          throw new Error(
+            `unsupported Workboard dispatch owner mode: ${formatErrorMessage(ownerMode)}`,
+          );
+        }
+        const isAdmin =
+          Array.isArray(client?.connect?.scopes) &&
+          client.connect.scopes.includes("operator.admin");
         const result = await dispatchAndStartWorkboardCards({
           store,
           subagent: api.runtime.subagent,
+          managedFlows: api.runtime.tasks.managedFlows,
           worktrees: api.runtime.worktrees,
           options: {
             boardId: typeof boardId === "string" ? boardId : undefined,
-            allowManagedWorktrees:
-              Array.isArray(client?.connect?.scopes) &&
-              client.connect.scopes.includes("operator.admin"),
+            allowManagedWorktrees: isAdmin,
+            ...(ownerMode === CANONICAL_MAIN_OWNER_MODE
+              ? {
+                  canonicalOwnerForRouteLess: true,
+                  resolveRequesterRouteForCard: async (
+                    _card: WorkboardCard,
+                    proposedWorkerSessionKey: string,
+                  ) => {
+                    const resolved = await api.runtime.subagent.resolveOwnerSession({
+                      sessionKey: proposedWorkerSessionKey,
+                    });
+                    if (
+                      resolved.status !== "resolved" ||
+                      !resolved.workerSessionKey?.trim() ||
+                      !resolved.ownerSessionKey?.trim() ||
+                      !resolved.workspaceDir?.trim()
+                    ) {
+                      throw new Error("canonical Workboard owner route is unavailable");
+                    }
+                    return {
+                      workerSessionKey: resolved.workerSessionKey.trim(),
+                      ownerSessionKey: resolved.ownerSessionKey.trim(),
+                      workspaceDir: resolved.workspaceDir.trim(),
+                    };
+                  },
+                }
+              : {}),
           },
         });
+        if (result.needsReconciliation) {
+          await params.onReconciliationNeeded?.();
+        }
         respond(true, {
           ...result,
           promoted: result.promoted.map(redactClaimToken),
@@ -481,7 +553,13 @@ export function registerWorkboardGatewayMethods(params: {
     async ({ params: requestParams, respond }) => {
       try {
         const result = await store.runs(readId(requestParams));
-        respond(true, { ...result, card: redactClaimToken(result.card) });
+        respond(true, {
+          ...result,
+          card: redactClaimToken(result.card),
+          ...(params.readManagedFlow?.(result.card)
+            ? { managedFlow: params.readManagedFlow(result.card) }
+            : {}),
+        });
       } catch (error) {
         respondError(respond, error);
       }

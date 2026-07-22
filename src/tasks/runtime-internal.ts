@@ -19,6 +19,7 @@ export {
   markTaskTerminalById,
   maybeDeliverTaskTerminalUpdate,
   recordTaskProgressByRunId,
+  reconcileTaskWithVerifiedWorkboardCompletion,
   reloadTaskRegistryFromStore,
   resetTaskRegistryDeliveryRuntimeForTests,
   resolveTaskForLookupToken,

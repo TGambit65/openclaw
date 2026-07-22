@@ -36,7 +36,7 @@ const BUNDLED_TYPED_HOOK_REGISTRATION_GUARDS = {
   "extensions/memory-core/src/dreaming.ts": ["before_agent_reply", "gateway_start", "gateway_stop"],
   "extensions/memory-lancedb/index.ts": ["agent_end", "before_prompt_build", "session_end"],
   "extensions/thread-ownership/index.ts": ["message_received", "message_sending"],
-  "extensions/workboard/index.ts": ["subagent_ended"],
+  "extensions/workboard/index.ts": ["gateway_start", "subagent_ended"],
 } as const satisfies Record<
   (typeof BUNDLED_TYPED_HOOK_REGISTRATION_FILES)[number],
   readonly string[]

@@ -26,7 +26,150 @@ function readPayload(result: unknown): Record<string, unknown> {
   return (result as { details?: Record<string, unknown> }).details ?? {};
 }
 
+function createDispatchApi(keyed: WorkboardKeyedStore) {
+  const flows = new Map<string, Record<string, unknown>>();
+  const run = vi.fn(async (params: { idempotencyKey?: string }) => ({
+    runId: params.idempotencyKey!,
+  }));
+  const resolveOwnerSession = vi.fn(async ({ sessionKey }: { sessionKey: string }) => ({
+    status: "resolved" as const,
+    workerSessionKey: sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`,
+    ownerSessionKey: "agent:main:main",
+    workspaceDir: "/tmp/canonical-worker-workspace",
+  }));
+  const bindSession = vi.fn(
+    ({ sessionKey, requesterOrigin }: { sessionKey: string; requesterOrigin?: unknown }) => ({
+      sessionKey,
+      list: vi.fn(() => [...flows.values()]),
+      get: vi.fn((flowId: string) => flows.get(flowId)),
+      createManaged: vi.fn((input: Record<string, unknown>) => {
+        const flowId = `flow-${flows.size + 1}`;
+        const flow = {
+          ...input,
+          flowId,
+          syncMode: "managed",
+          ownerKey: sessionKey,
+          requesterOrigin,
+          revision: 1,
+        };
+        flows.set(flowId, flow);
+        return flow;
+      }),
+      resume: vi.fn((input: { flowId: string }) => {
+        const current = flows.get(input.flowId)!;
+        const flow = { ...current, status: "running", revision: Number(current.revision) + 1 };
+        flows.set(input.flowId, flow);
+        return { applied: true, flow };
+      }),
+      setWaiting: vi.fn(
+        (input: {
+          flowId: string;
+          currentStep?: string;
+          stateJson?: unknown;
+          waitJson?: unknown;
+        }) => {
+          const current = flows.get(input.flowId)!;
+          const flow = {
+            ...current,
+            status: "waiting",
+            revision: Number(current.revision) + 1,
+            currentStep: input.currentStep,
+            stateJson: input.stateJson,
+            waitJson: input.waitJson,
+          };
+          flows.set(input.flowId, flow);
+          return { applied: true, flow };
+        },
+      ),
+      fail: vi.fn(
+        (input: {
+          flowId: string;
+          stateJson?: unknown;
+          blockedSummary?: string;
+          endedAt?: number;
+        }) => {
+          const current = flows.get(input.flowId)!;
+          const flow = {
+            ...current,
+            status: "failed",
+            revision: Number(current.revision) + 1,
+            stateJson: input.stateJson,
+            blockedSummary: input.blockedSummary,
+            endedAt: input.endedAt,
+          };
+          flows.set(input.flowId, flow);
+          return { applied: true, flow };
+        },
+      ),
+    }),
+  );
+  const api = {
+    runtime: {
+      state: { openKeyedStore: vi.fn(() => keyed) },
+      subagent: { run, resolveOwnerSession },
+      tasks: { managedFlows: { bindSession } },
+      worktrees: {
+        create: vi.fn(),
+        release: vi.fn(),
+        removeIfLossless: vi.fn(),
+      },
+    },
+  } as unknown as OpenClawPluginApi;
+  return { api, run, bindSession, resolveOwnerSession, flows };
+}
+
 describe("workboard tools", () => {
+  it("terminalizes and detaches a managed flow when its worker blocks", async () => {
+    const keyed = createMemoryStore();
+    const { api, flows } = createDispatchApi(keyed);
+    const store = new WorkboardStore(keyed);
+    const tools = new Map(
+      createWorkboardTools({
+        api,
+        store,
+        context: {
+          agentId: "main",
+          sessionKey: "agent:main:telegram:direct:requester",
+          deliveryContext: { channel: "telegram", to: "requester" },
+          workspaceDir: "/tmp/requester-workspace",
+        } as never,
+      }).map((tool) => [tool.name, tool]),
+    );
+    const created = readPayload(
+      await tools.get("workboard_create")?.execute("create-blocked", {
+        title: "Managed blocker",
+        status: "ready",
+      }),
+    ).card as { id: string };
+    await tools.get("workboard_dispatch")?.execute("dispatch-blocked", {});
+    const running = await store.get(created.id);
+    const token = running?.metadata?.claim?.token;
+    const flowId = running?.metadata?.automation?.flowId;
+    const workflowIdempotencyKey = running?.metadata?.automation?.idempotencyKey;
+    if (!token || !flowId || !workflowIdempotencyKey) {
+      throw new Error("expected dispatched managed Workboard identity");
+    }
+
+    await tools.get("workboard_block")?.execute("block-managed", {
+      id: created.id,
+      token,
+      reason: "Waiting for operator input.",
+    });
+
+    expect(flows.get(flowId)).toMatchObject({
+      status: "failed",
+      blockedSummary: "Waiting for operator input.",
+      stateJson: expect.objectContaining({ phase: "failed", runId: running?.runId }),
+    });
+    const blocked = await store.get(created.id);
+    expect(blocked).toMatchObject({ status: "blocked", execution: { status: "blocked" } });
+    expect(blocked?.metadata?.automation).not.toHaveProperty("flowId");
+    expect(blocked?.metadata?.automation).not.toHaveProperty("flowOwnerSessionKey");
+    expect(blocked?.metadata?.automation).not.toHaveProperty("controllerId");
+    expect(blocked?.metadata?.automation?.idempotencyKey).not.toBe(workflowIdempotencyKey);
+    await expect(store.unblock(created.id)).resolves.toMatchObject({ status: "todo" });
+  });
+
   it("lists, claims, heartbeats, and reads worker context", async () => {
     const keyed = createMemoryStore();
     const api = {
@@ -57,6 +200,7 @@ describe("workboard tools", () => {
         position: 1000,
         createdAt: 1,
         updatedAt: 1,
+        events: [{ id: "event-card-1", kind: "created", at: 1 }],
       },
     });
     await store.register("archived-1", {
@@ -224,19 +368,21 @@ describe("workboard tools", () => {
 
   it("creates dependent cards and completes claimed work through tools", async () => {
     const keyed = createMemoryStore();
-    const api = {
-      runtime: {
-        state: {
-          openKeyedStore: vi.fn(() => keyed),
-        },
-      },
-    } as unknown as OpenClawPluginApi;
+    const { api, run, bindSession } = createDispatchApi(keyed);
     const store = new WorkboardStore(keyed);
+    const completeCard = vi.fn(
+      async (...args: Parameters<WorkboardStore["complete"]>) => await store.complete(...args),
+    );
     const tools = new Map(
       createWorkboardTools({
         api,
         store,
-        context: { agentId: "main" } as never,
+        completeCard,
+        context: {
+          agentId: "main",
+          sessionKey: "agent:main:telegram:direct:requester",
+          deliveryContext: { channel: "telegram", to: "requester" },
+        } as never,
       }).map((tool) => [tool.name, tool]),
     );
 
@@ -291,26 +437,98 @@ describe("workboard tools", () => {
       }),
     );
     expect(completed.card).toMatchObject({ status: "done" });
+    expect(completeCard).toHaveBeenCalledWith(
+      parent.id,
+      expect.objectContaining({ summary: "Done." }),
+      expect.objectContaining({ ownerId: "main", token }),
+    );
 
     const dispatch = readPayload(await tools.get("workboard_dispatch")?.execute("call-5", {}));
     expect(dispatch.promoted).toEqual([expect.objectContaining({ id: child.id, status: "ready" })]);
+    expect(dispatch.started).toEqual([
+      expect.objectContaining({ cardId: child.id, runId: expect.any(String) }),
+    ]);
+    expect(run).toHaveBeenCalledOnce();
+    expect(bindSession).toHaveBeenCalledWith({
+      sessionKey: "agent:main:telegram:direct:requester",
+      requesterOrigin: { channel: "telegram", to: "requester" },
+    });
   });
 
-  it("redacts claim tokens from dispatch tool results", async () => {
+  it("persists a fixed owner policy for cron-created work and resolves it at dispatch", async () => {
     const keyed = createMemoryStore();
-    const api = {
-      runtime: {
-        state: {
-          openKeyedStore: vi.fn(() => keyed),
-        },
-      },
-    } as unknown as OpenClawPluginApi;
+    const { api, run, bindSession, resolveOwnerSession } = createDispatchApi(keyed);
     const store = new WorkboardStore(keyed);
     const tools = new Map(
       createWorkboardTools({
         api,
         store,
-        context: { agentId: "main" } as never,
+        context: {
+          agentId: "main",
+          sessionKey: "agent:main:cron:nightly:run:1",
+          deliveryContext: { channel: "telegram", to: "cron-route" },
+          workspaceDir: "/tmp/cron-workspace",
+        } as never,
+      }).map((tool) => [tool.name, tool]),
+    );
+
+    const createdPayload = readPayload(
+      await tools.get("workboard_create")?.execute("call-create", {
+        title: "Scheduled durable workflow",
+        status: "scheduled",
+        scheduledAt: 1,
+      }),
+    );
+    const cardId = (createdPayload.card as { id: string }).id;
+    await expect(store.get(cardId)).resolves.toMatchObject({
+      metadata: {
+        automation: { requesterOwnerMode: "canonical_main_no_origin" },
+      },
+    });
+    const beforeDispatch = await store.get(cardId);
+    expect(beforeDispatch?.metadata?.automation?.requesterSessionKey).toBeUndefined();
+    expect(beforeDispatch?.metadata?.automation?.requesterOrigin).toBeUndefined();
+    expect(beforeDispatch?.metadata?.automation?.requesterWorkspace).toBeUndefined();
+
+    await tools.get("workboard_dispatch")?.execute("call-dispatch", {});
+
+    const proposedWorker = `subagent:workboard-default-${cardId}`;
+    expect(resolveOwnerSession).toHaveBeenCalledWith({ sessionKey: proposedWorker });
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: `agent:main:${proposedWorker}`,
+        flowOwnerSessionKey: "agent:main:main",
+        cwd: "/tmp/canonical-worker-workspace",
+      }),
+    );
+    expect(bindSession).toHaveBeenCalledWith({ sessionKey: "agent:main:main" });
+    const running = await store.get(cardId);
+    expect(running).toMatchObject({
+      status: "running",
+      metadata: {
+        automation: {
+          controllerId: "workboard",
+          flowOwnerSessionKey: "agent:main:main",
+          requesterWorkspace: "/tmp/canonical-worker-workspace",
+        },
+      },
+    });
+    expect(running?.metadata?.automation?.requesterOwnerMode).toBeUndefined();
+  });
+
+  it("redacts claim tokens from dispatch tool results", async () => {
+    const keyed = createMemoryStore();
+    const { api } = createDispatchApi(keyed);
+    const store = new WorkboardStore(keyed);
+    const tools = new Map(
+      createWorkboardTools({
+        api,
+        store,
+        context: {
+          agentId: "main",
+          sessionKey: "agent:main:telegram:direct:requester",
+          deliveryContext: { channel: "telegram", to: "requester" },
+        } as never,
       }).map((tool) => [tool.name, tool]),
     );
     const card = await store.create({

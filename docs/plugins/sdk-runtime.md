@@ -270,6 +270,8 @@ two-party event loops that do not go through the shared inbound reply runner.
 
     `deleteSession(...)` can delete sessions created by the same plugin through `api.runtime.subagent.run(...)`. Deleting arbitrary user or operator sessions still requires an admin-scoped Gateway request.
 
+    `getRecoveryOwnership(...)`, `getRunState(...)`, and `requireCompletionDelivery(...)` are trusted recovery operations reserved for the bundled Workboard controller. They validate an exact Workboard-labeled session/run generation and return `unknown` outside Workboard scope or whenever ownership cannot be proven. `requireCompletionDelivery(...)` atomically freezes the verified card summary, passed proof, hashed local artifacts, expected card/run identity, and managed-flow linkage before the run becomes terminal; retries use the same idempotency key, and `getRunState(...)` returns that canonical intent after a lost response or process restart. Raw Workboard claim tokens are never accepted, persisted, or returned by this core bridge.
+
   </Accordion>
   <Accordion title="api.runtime.nodes">
     List connected nodes and invoke a node-host command from Gateway-loaded plugin code or from plugin CLI commands. Use this when a plugin owns local work on a paired device, for example a browser or audio bridge on another Mac.

@@ -17,6 +17,7 @@ import {
   resetSubagentRegistryForTests,
   testing as subagentRegistryTesting,
 } from "../../agents/subagent-registry.js";
+import type { AgentEventPayload } from "../../infra/agent-events.js";
 import {
   onDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -25,6 +26,7 @@ import {
 } from "../../infra/diagnostic-events.js";
 import {
   interruptSessionWorkAdmissions,
+  isSessionWorkAdmissionActive,
   runExclusiveSessionLifecycleMutation,
 } from "../../sessions/session-lifecycle-admission.js";
 import {
@@ -33,11 +35,17 @@ import {
   setDetachedTaskLifecycleRuntime,
 } from "../../tasks/detached-task-runtime.js";
 import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
+import {
+  createTaskRecord,
   findTaskByRunId,
   listTaskRecords,
   markTaskTerminalById,
   resetTaskRegistryForTests,
 } from "../../tasks/task-registry.js";
+import { configureTaskRegistryRuntime } from "../../tasks/task-registry.store.js";
 import { withTempDir } from "../../test-helpers/temp-dir.js";
 import { captureEnv, setTestEnvValue } from "../../test-utils/env.js";
 import { setGatewayDedupeEntry } from "./agent-wait-dedupe.js";
@@ -56,6 +64,7 @@ const mocks = vi.hoisted(() => ({
   clearAgentRunContext: vi.fn(),
   registerAgentRunContext: vi.fn(),
   emitAgentEvent: vi.fn(),
+  agentEventListeners: [] as Array<(event: AgentEventPayload) => void>,
   performGatewaySessionReset: vi.fn(),
   emitGatewaySessionEndPluginHook: vi.fn(),
   emitGatewaySessionStartPluginHook: vi.fn(),
@@ -182,7 +191,10 @@ vi.mock("../../infra/agent-events.js", () => ({
   emitAgentEvent: mocks.emitAgentEvent,
   getAgentEventLifecycleGeneration: () => mocks.lifecycleGeneration,
   registerAgentRunContext: mocks.registerAgentRunContext,
-  onAgentEvent: vi.fn(),
+  onAgentEvent: vi.fn((listener: (event: AgentEventPayload) => void) => {
+    mocks.agentEventListeners.push(listener);
+    return () => {};
+  }),
 }));
 
 vi.mock("../../agents/subagent-registry-read.js", () => ({
@@ -621,8 +633,25 @@ async function invokeAgentIdentityGet(
   return respond;
 }
 
+async function invokeAgentWait(
+  params: Parameters<(typeof agentHandlers)["agent.wait"]>[0]["params"],
+  context = makeContext(),
+) {
+  const respond = vi.fn();
+  await agentHandlers["agent.wait"]({
+    params,
+    respond: respond as never,
+    context,
+    req: { type: "req", id: "agent-wait-test-req", method: "agent.wait" },
+    client: null,
+    isWebchatConnect: () => false,
+  });
+  return respond;
+}
+
 describe("gateway agent handler", () => {
   afterEach(() => {
+    resetTaskFlowRegistryForTests({ persist: false });
     envSnapshot.restore();
     resetDetachedTaskLifecycleRuntimeForTests();
     resetDiagnosticEventsForTest();
@@ -651,6 +680,152 @@ describe("gateway agent handler", () => {
     dateOnlyFakeClockActive = false;
     vi.useRealTimers();
     resetExecApprovalFollowupRuntimeHandoffsForTests();
+  });
+
+  it("restores terminal agent.wait errors from durable subagent tasks after restart", async () => {
+    await withTempDir({ prefix: "openclaw-agent-wait-durable-task-" }, async (root) => {
+      setTestEnvValue("OPENCLAW_STATE_DIR", root);
+      resetTaskRegistryForTests({ persist: false });
+      const runId = "durable-failed-subagent-run";
+      const startedAt = 1_700_000_000_000;
+      const endedAt = startedAt + 10_000;
+      const task = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:durable-wait",
+        runId,
+        task: "Resume after a gateway restart",
+        status: "running",
+        startedAt,
+        deliveryStatus: "not_applicable",
+        notifyPolicy: "silent",
+      });
+      if (!task) {
+        throw new Error("expected durable subagent task");
+      }
+      markTaskTerminalById({
+        taskId: task.taskId,
+        status: "failed",
+        endedAt,
+        error: "gateway closed (1012): service restart",
+      });
+      resetTaskRegistryForTests({ persist: false });
+
+      const respond = await invokeAgentWait({ runId, timeoutMs: 1 });
+
+      expectRecordFields(mockCallArg(respond, 0, 1), {
+        runId,
+        status: "error",
+        startedAt,
+        endedAt,
+        error: "gateway closed (1012): service restart",
+      });
+    });
+  });
+
+  it("does not use stale durable task state while the run id is active", async () => {
+    await withTempDir({ prefix: "openclaw-agent-wait-active-run-" }, async (root) => {
+      setTestEnvValue("OPENCLAW_STATE_DIR", root);
+      resetTaskRegistryForTests({ persist: false });
+      const runId = "reused-active-subagent-run";
+      const task = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:active-wait",
+        runId,
+        task: "Do not reuse stale terminal state",
+        status: "running",
+        deliveryStatus: "not_applicable",
+        notifyPolicy: "silent",
+      });
+      if (!task) {
+        throw new Error("expected durable subagent task");
+      }
+      markTaskTerminalById({
+        taskId: task.taskId,
+        status: "failed",
+        endedAt: Date.now(),
+        error: "old failed generation",
+      });
+      const context = makeContext();
+      context.dedupe.set(`agent:${runId}`, {
+        ts: Date.now() + 1,
+        ok: true,
+        payload: { runId, status: "accepted" },
+      });
+
+      const respond = await invokeAgentWait({ runId, timeoutMs: 0 }, context);
+
+      expectRecordFields(mockCallArg(respond, 0, 1), {
+        runId,
+        status: "timeout",
+      });
+    });
+  });
+
+  it("lets an active chat generation outrank a stale lifecycle terminal", async () => {
+    const runId = "reused-active-chat-lifecycle-run";
+    for (const listener of mocks.agentEventListeners) {
+      listener({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: {
+          phase: "end",
+          startedAt: 1_000,
+          endedAt: 2_000,
+        },
+      });
+    }
+    const context = makeContext();
+    context.chatAbortControllers.set(runId, {
+      controller: new AbortController(),
+      sessionId: "current-session",
+      sessionKey: "agent:main:main",
+      startedAtMs: Date.now(),
+      expiresAtMs: Date.now() + 60_000,
+      kind: "chat-send",
+    });
+
+    const respond = await invokeAgentWait({ runId, timeoutMs: 0 }, context);
+
+    expectRecordFields(mockCallArg(respond, 0, 1), {
+      runId,
+      status: "timeout",
+    });
+  });
+
+  it("lets a current accepted agent dedupe outrank a stale lifecycle terminal", async () => {
+    const runId = "reused-accepted-agent-lifecycle-run";
+    for (const listener of mocks.agentEventListeners) {
+      listener({
+        runId,
+        seq: 1,
+        stream: "lifecycle",
+        ts: Date.now(),
+        data: {
+          phase: "end",
+          startedAt: 1_000,
+          endedAt: 2_000,
+        },
+      });
+    }
+    const context = makeContext();
+    context.dedupe.set(`agent:${runId}`, {
+      ts: Date.now(),
+      ok: true,
+      payload: { runId, status: "accepted" },
+    });
+
+    const respond = await invokeAgentWait({ runId, timeoutMs: 0 }, context);
+
+    expectRecordFields(mockCallArg(respond, 0, 1), {
+      runId,
+      status: "timeout",
+    });
   });
 
   it("passes resolved maintenance config to the gateway admission store write", async () => {
@@ -4315,7 +4490,418 @@ describe("gateway agent handler", () => {
     });
   });
 
-  it("keeps plugin SDK subagent runs best-effort when registry persistence fails", async () => {
+  it("links a trusted Workboard subagent to the initiating requester-owned flow", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-workboard-flow-" }, async (root) => {
+      useTestStateDir(root);
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      resetSubagentRegistryForTests({ persist: false });
+      const runId = "workboard-flow-run";
+      const childSessionKey = "agent:work:subagent:workboard-card";
+      const cfg = {
+        session: { mainKey: "main", scope: "per-channel-peer" },
+        agents: { list: [{ id: "work", default: true }] },
+      };
+      const requesterSessionKey = "agent:work:telegram:direct:kelly";
+      const flow = requireValue(
+        createManagedTaskFlow({
+          ownerKey: requesterSessionKey,
+          requesterOrigin: {
+            channel: "telegram",
+            to: "kelly",
+            accountId: "default",
+          },
+          controllerId: "workboard",
+          goal: "Finish the Workboard card",
+          status: "running",
+        }),
+        "expected Workboard managed flow",
+      );
+      mocks.listAgentIds.mockReturnValue(["work"]);
+      mocks.loadConfigReturn = cfg;
+      mocks.loadSessionEntry.mockReturnValue({
+        cfg,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: "workboard-flow-session", updatedAt: Date.now() },
+        canonicalKey: childSessionKey,
+      });
+      mocks.updateSessionStore.mockImplementation(
+        async (_path, updater) =>
+          await updater({
+            [childSessionKey]: {
+              sessionId: "workboard-flow-session",
+              updatedAt: Date.now(),
+            },
+          }),
+      );
+      mocks.agentCommand.mockResolvedValue({
+        payloads: [{ text: "ok" }],
+        meta: { durationMs: 100 },
+      });
+      const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+
+      await invokeAgent(
+        {
+          message: "run the Workboard worker",
+          sessionKey: childSessionKey,
+          parentFlowId: flow.flowId,
+          flowOwnerSessionKey: requesterSessionKey,
+          cwd: "/tmp/workboard-managed-worktree",
+          idempotencyKey: runId,
+        },
+        {
+          reqId: runId,
+          client: {
+            connect: baseClient.connect,
+            internal: {
+              ...baseClient.internal,
+              agentRunTracking: "plugin_subagent",
+              pluginRuntimeOwnerId: "workboard",
+            },
+          },
+        },
+      );
+
+      await waitForAssertion(() => {
+        expectRecordFields(findTaskByRunId(runId), {
+          runtime: "subagent",
+          runId,
+          childSessionKey,
+          ownerKey: requesterSessionKey,
+          requesterSessionKey,
+          parentFlowId: flow.flowId,
+          label: "plugin:workboard",
+        });
+      });
+      expectRecordFields(getSubagentRunByChildSessionKey(childSessionKey), {
+        runId,
+        requesterSessionKey,
+        requesterOrigin: { channel: "telegram", to: "kelly", accountId: "default" },
+        controllerSessionKey: requesterSessionKey,
+        workspaceDir: "/tmp/workboard-managed-worktree",
+      });
+    });
+  });
+
+  it("rejects a Workboard flow owned by another agent before model dispatch", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-cross-agent-flow-" }, async (root) => {
+      useTestStateDir(root);
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      resetSubagentRegistryForTests({ persist: false });
+      const cfg = {
+        session: { mainKey: "main", scope: "per-channel-peer" },
+        agents: { list: [{ id: "main", default: true }, { id: "other" }] },
+      };
+      const childSessionKey = "agent:main:subagent:cross-agent-flow";
+      const flow = requireValue(
+        createManagedTaskFlow({
+          ownerKey: "agent:other:telegram:direct:kelly",
+          controllerId: "workboard",
+          goal: "Must not cross agent ownership",
+          status: "running",
+        }),
+        "expected cross-agent managed flow",
+      );
+      mocks.listAgentIds.mockReturnValue(["main", "other"]);
+      mocks.loadConfigReturn = cfg;
+      mocks.loadSessionEntry.mockReturnValue({
+        cfg,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: "cross-agent-flow-session", updatedAt: Date.now() },
+        canonicalKey: childSessionKey,
+      });
+      mocks.updateSessionStore.mockResolvedValue(undefined);
+      const commandCallCount = mocks.agentCommand.mock.calls.length;
+      const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+
+      const respond = await invokeAgent(
+        {
+          message: "run a cross-agent linked worker",
+          sessionKey: childSessionKey,
+          parentFlowId: flow.flowId,
+          flowOwnerSessionKey: flow.ownerKey,
+          idempotencyKey: "cross-agent-linked-run",
+        },
+        {
+          reqId: "cross-agent-linked-run",
+          client: {
+            connect: baseClient.connect,
+            internal: {
+              ...baseClient.internal,
+              agentRunTracking: "plugin_subagent",
+              pluginRuntimeOwnerId: "workboard",
+            },
+          },
+        },
+      );
+
+      expectRespondError(respond, {
+        code: ErrorCodes.UNAVAILABLE,
+        message: "plugin subagent registration failed",
+      });
+      expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+      expect(findTaskByRunId("cross-agent-linked-run")).toBeUndefined();
+      expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+    });
+  });
+
+  it("rejects managed-flow linkage from non-Workboard plugins before model dispatch", async () => {
+    const cfg = { session: { mainKey: "main", scope: "per-sender" } };
+    const childSessionKey = "agent:main:subagent:untrusted-flow";
+    mocks.loadConfigReturn = cfg;
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg,
+      storePath: "/tmp/sessions.json",
+      entry: { sessionId: "untrusted-flow-session", updatedAt: Date.now() },
+      canonicalKey: childSessionKey,
+    });
+    const commandCallCount = mocks.agentCommand.mock.calls.length;
+    const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+
+    const respond = await invokeAgent(
+      {
+        message: "run an untrusted linked worker",
+        sessionKey: childSessionKey,
+        parentFlowId: "forged-flow",
+        flowOwnerSessionKey: "agent:main:main",
+        idempotencyKey: "untrusted-linked-run",
+      },
+      {
+        reqId: "untrusted-linked-run",
+        client: {
+          connect: baseClient.connect,
+          internal: {
+            ...baseClient.internal,
+            agentRunTracking: "plugin_subagent",
+            pluginRuntimeOwnerId: "memory-core",
+          },
+        },
+      },
+    );
+
+    expectRespondError(respond, {
+      code: ErrorCodes.INVALID_REQUEST,
+      message: "managed-flow linkage is reserved for trusted Workboard subagent runs",
+    });
+    expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+    expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+  });
+
+  it("rejects a non-Workboard managed flow before model dispatch", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-mismatched-flow-" }, async (root) => {
+      useTestStateDir(root);
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      resetSubagentRegistryForTests({ persist: false });
+      const cfg = { session: { mainKey: "main", scope: "per-sender" } };
+      const childSessionKey = "agent:main:subagent:mismatched-flow";
+      const flow = requireValue(
+        createManagedTaskFlow({
+          ownerKey: "agent:main:main",
+          controllerId: "another-controller",
+          goal: "Not a Workboard flow",
+          status: "running",
+        }),
+        "expected mismatched managed flow",
+      );
+      mocks.loadConfigReturn = cfg;
+      mocks.loadSessionEntry.mockReturnValue({
+        cfg,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: "mismatched-flow-session", updatedAt: Date.now() },
+        canonicalKey: childSessionKey,
+      });
+      mocks.updateSessionStore.mockResolvedValue(undefined);
+      const commandCallCount = mocks.agentCommand.mock.calls.length;
+      const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+
+      const respond = await invokeAgent(
+        {
+          message: "run a mismatched linked worker",
+          sessionKey: childSessionKey,
+          parentFlowId: flow.flowId,
+          flowOwnerSessionKey: "agent:main:main",
+          idempotencyKey: "mismatched-linked-run",
+        },
+        {
+          reqId: "mismatched-linked-run",
+          client: {
+            connect: baseClient.connect,
+            internal: {
+              ...baseClient.internal,
+              agentRunTracking: "plugin_subagent",
+              pluginRuntimeOwnerId: "workboard",
+            },
+          },
+        },
+      );
+
+      expectRespondError(respond, {
+        code: ErrorCodes.UNAVAILABLE,
+        message: "plugin subagent registration failed",
+      });
+      expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+      expect(findTaskByRunId("mismatched-linked-run")).toBeUndefined();
+      expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+    });
+  });
+
+  it("fails closed when the exact Workboard child task cannot be persisted", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-workboard-task-fail-" }, async (root) => {
+      useTestStateDir(root);
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      resetSubagentRegistryForTests({ persist: false });
+      const cfg = { session: { mainKey: "main", scope: "per-sender" } };
+      const childSessionKey = "agent:main:subagent:task-persist-fail";
+      const flow = requireValue(
+        createManagedTaskFlow({
+          ownerKey: "agent:main:main",
+          controllerId: "workboard",
+          goal: "Fail before dispatch",
+          status: "running",
+        }),
+        "expected Workboard managed flow",
+      );
+      configureTaskRegistryRuntime({
+        store: {
+          loadSnapshot: () => ({ tasks: new Map(), deliveryStates: new Map() }),
+          saveSnapshot: () => {
+            throw new Error("task store unavailable");
+          },
+        },
+      });
+      mocks.loadConfigReturn = cfg;
+      mocks.loadSessionEntry.mockReturnValue({
+        cfg,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: "task-persist-fail-session", updatedAt: Date.now() },
+        canonicalKey: childSessionKey,
+      });
+      mocks.updateSessionStore.mockResolvedValue(undefined);
+      const commandCallCount = mocks.agentCommand.mock.calls.length;
+      const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+
+      const respond = await invokeAgent(
+        {
+          message: "run the worker",
+          sessionKey: childSessionKey,
+          parentFlowId: flow.flowId,
+          flowOwnerSessionKey: "agent:main:main",
+          idempotencyKey: "task-persist-fail-run",
+        },
+        {
+          reqId: "task-persist-fail-run",
+          client: {
+            connect: baseClient.connect,
+            internal: {
+              ...baseClient.internal,
+              agentRunTracking: "plugin_subagent",
+              pluginRuntimeOwnerId: "workboard",
+            },
+          },
+        },
+      );
+
+      expectRespondError(respond, {
+        code: ErrorCodes.UNAVAILABLE,
+        message: "plugin subagent registration failed",
+      });
+      expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+      expect(findTaskByRunId("task-persist-fail-run")).toBeUndefined();
+      expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+    });
+  });
+
+  it("rolls back a strict Workboard task so the same idempotency key can retry", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-workboard-registry-retry-" }, async (root) => {
+      useTestStateDir(root);
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests();
+      resetSubagentRegistryForTests({ persist: false });
+      const cfg = { session: { mainKey: "main", scope: "per-sender" } };
+      const childSessionKey = "agent:main:subagent:registry-retry";
+      const runId = "workboard-registry-retry-run";
+      const flow = requireValue(
+        createManagedTaskFlow({
+          ownerKey: "agent:main:main",
+          controllerId: "workboard",
+          goal: "Retry strict registration",
+          status: "running",
+        }),
+        "expected Workboard managed flow",
+      );
+      mocks.loadConfigReturn = cfg;
+      mocks.loadSessionEntry.mockReturnValue({
+        cfg,
+        storePath: "/tmp/sessions.json",
+        entry: { sessionId: "registry-retry-session", updatedAt: Date.now() },
+        canonicalKey: childSessionKey,
+      });
+      mocks.updateSessionStore.mockResolvedValue(undefined);
+      mocks.agentCommand.mockReturnValue(new Promise(() => {}));
+      subagentRegistryTesting.setDepsForTest({
+        persistSubagentRunsToDiskOrThrow: () => {
+          throw new Error("one-shot registry persistence failure");
+        },
+      });
+      const baseClient = requireValue(backendGatewayClient(), "expected backend client");
+      const pluginClient: AgentHandlerArgs["client"] = {
+        connect: baseClient.connect,
+        internal: {
+          ...baseClient.internal,
+          agentRunTracking: "plugin_subagent",
+          pluginRuntimeOwnerId: "workboard",
+        },
+      };
+      const request = {
+        message: "run the retryable worker",
+        sessionKey: childSessionKey,
+        parentFlowId: flow.flowId,
+        flowOwnerSessionKey: "agent:main:main",
+        idempotencyKey: runId,
+      };
+      const commandCallCount = mocks.agentCommand.mock.calls.length;
+
+      const first = await invokeAgent(request, {
+        reqId: `${runId}-first`,
+        client: pluginClient,
+      });
+      expectRespondError(first, {
+        code: ErrorCodes.UNAVAILABLE,
+        message: "plugin subagent registration failed",
+      });
+      expect(findTaskByRunId(runId)).toBeUndefined();
+      expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+      expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+
+      subagentRegistryTesting.setDepsForTest({
+        callGateway: vi.fn(() => new Promise(() => {})) as never,
+      });
+      const second = await invokeAgent(request, {
+        reqId: `${runId}-second`,
+        client: pluginClient,
+      });
+      expect(mockCallArg(second)).toBe(true);
+      expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount + 1);
+      const matching = listTaskRecords().filter((task) => task.runId === runId);
+      expect(matching).toHaveLength(1);
+      expectRecordFields(matching[0], {
+        status: "running",
+        runtime: "subagent",
+        childSessionKey,
+        ownerKey: "agent:main:main",
+        parentFlowId: flow.flowId,
+      });
+      expectRecordFields(getSubagentRunByChildSessionKey(childSessionKey), {
+        runId,
+        requesterSessionKey: "agent:main:main",
+      });
+    });
+  });
+
+  it("rejects plugin SDK subagent runs before dispatch when registry persistence fails", async () => {
     await withTempDir(
       { prefix: "openclaw-gateway-plugin-subagent-registry-fail-" },
       async (root) => {
@@ -4359,7 +4945,7 @@ describe("gateway agent handler", () => {
         const baseClient = requireValue(backendGatewayClient(), "expected backend client");
         const commandCallCount = mocks.agentCommand.mock.calls.length;
 
-        await invokeAgent(
+        const respond = await invokeAgent(
           {
             message: "background plugin subagent task",
             sessionKey: childSessionKey,
@@ -4379,18 +4965,27 @@ describe("gateway agent handler", () => {
           },
         );
 
-        expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount + 1);
-        await waitForAssertion(() => {
-          const task = requireValue(findTaskByRunId(runId), "expected fallback cli task");
-          expectRecordFields(task, {
-            runtime: "cli",
-            childSessionKey,
-            status: "succeeded",
-            terminalSummary: "completed",
-          });
+        expectRespondError(respond, {
+          code: ErrorCodes.UNAVAILABLE,
+          message: "plugin subagent registration failed",
         });
+        expect(mocks.agentCommand).toHaveBeenCalledTimes(commandCallCount);
+        expect(findTaskByRunId(runId)).toBeUndefined();
+        expect(getSubagentRunByChildSessionKey(childSessionKey)).toBeNull();
+        expect(context.chatAbortControllers.has(runId)).toBe(false);
+        expect(vi.mocked(context.removeChatRun).mock.calls).toHaveLength(
+          vi.mocked(context.addChatRun).mock.calls.length,
+        );
+        expect(mocks.clearAgentRunContext).toHaveBeenCalledWith(runId, mocks.lifecycleGeneration);
+        expect(context.dedupe.size).toBe(0);
+        expect(
+          isSessionWorkAdmissionActive("/tmp/sessions.json", [
+            childSessionKey,
+            "plugin-subagent-registry-fail-session",
+          ]),
+        ).toBe(false);
         expect(context.logGateway.warn).toHaveBeenCalledWith(
-          expect.stringContaining("falling back to cli task tracking"),
+          expect.stringContaining("rejecting before dispatch"),
         );
       },
     );

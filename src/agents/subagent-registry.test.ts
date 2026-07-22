@@ -20,8 +20,15 @@ import {
   resetDetachedTaskLifecycleRuntimeForTests,
   setDetachedTaskLifecycleRuntime,
 } from "../tasks/detached-task-runtime.js";
-import { resetTaskFlowRegistryForTests } from "../tasks/task-flow-registry.js";
-import { resetTaskRegistryForTests } from "../tasks/task-registry.js";
+import { runTaskInFlow } from "../tasks/task-executor.js";
+import {
+  createManagedTaskFlow,
+  getTaskFlowById,
+  requestFlowCancel,
+  resetTaskFlowRegistryForTests,
+  updateFlowRecordByIdExpectedRevision,
+} from "../tasks/task-flow-registry.js";
+import { listTaskRecords, resetTaskRegistryForTests } from "../tasks/task-registry.js";
 import { findTaskByRunIdForStatus } from "../tasks/task-status-access.js";
 import {
   SUBAGENT_ENDED_REASON_COMPLETE,
@@ -159,6 +166,9 @@ const mocks = vi.hoisted(() => ({
   getSubagentRunsSnapshotForRead: vi.fn(
     (runs: Map<string, import("./subagent-registry.types.js").SubagentRunRecord>) => new Map(runs),
   ),
+  getSubagentRunsSnapshotForReadStrict: vi.fn(
+    (runs: Map<string, import("./subagent-registry.types.js").SubagentRunRecord>) => new Map(runs),
+  ),
   captureSubagentCompletionReply: vi.fn(async () => "final completion reply"),
   cleanupBrowserSessionsForLifecycleEnd: vi.fn(async () => {}),
   runSubagentAnnounceFlow: vi.fn(async () => true),
@@ -209,6 +219,7 @@ vi.mock("../sessions/session-lifecycle-events.js", () => ({
 vi.mock("./subagent-registry-state.js", () => ({
   clearSubagentRunsReadCacheForTest: mocks.clearSubagentRunsReadCacheForTest,
   getSubagentRunsSnapshotForRead: mocks.getSubagentRunsSnapshotForRead,
+  getSubagentRunsSnapshotForReadStrict: mocks.getSubagentRunsSnapshotForReadStrict,
   persistSubagentRunsToDisk: mocks.persistSubagentRunsToDisk,
   persistSubagentRunsToDiskOrThrow: mocks.persistSubagentRunsToDiskOrThrow,
   restoreSubagentRunsFromDisk: mocks.restoreSubagentRunsFromDisk,
@@ -283,6 +294,10 @@ describe("subagent registry seam flow", () => {
     mocks.scheduleOrphanRecovery.mockReset();
     mocks.resolveAgentTimeoutMs.mockReturnValue(1_000);
     mocks.restoreSubagentRunsFromDisk.mockReturnValue(0);
+    mocks.getSubagentRunsSnapshotForReadStrict.mockImplementation(
+      (runs: Map<string, import("./subagent-registry.types.js").SubagentRunRecord>) =>
+        new Map(runs),
+    );
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {
         return {
@@ -314,6 +329,8 @@ describe("subagent registry seam flow", () => {
     resetDetachedTaskLifecycleRuntimeForTests();
     mod.testing.setDepsForTest();
     mod.resetSubagentRegistryForTests({ persist: false });
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
     vi.useRealTimers();
   });
 
@@ -3980,6 +3997,159 @@ describe("subagent registry seam flow", () => {
     expect(run?.outcome).toBeUndefined();
   });
 
+  it("durably interrupts and requeues a stale run with lost execution context", async () => {
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return { status: "pending" };
+      }
+      return {};
+    });
+    mocks.loadSessionStore.mockReturnValue({
+      "agent:main:subagent:child": {
+        sessionId: "sess-child",
+        updatedAt: 333,
+        status: "running",
+        abortedLastRun: false,
+      },
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-stale-lost-context",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "resume after hard restart",
+      cleanup: "keep",
+    });
+
+    vi.setSystemTime(new Date("2026-03-24T12:04:00Z"));
+    await mod.testing.sweepOnceForTests();
+
+    await waitForFast(() => {
+      expectRecordFields(
+        getMockCallArg(mocks.scheduleOrphanRecovery, 0, 0, "orphan recovery"),
+        { delayMs: 1_000 },
+        "orphan recovery params",
+      );
+    });
+    const run = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-stale-lost-context");
+    expect(run?.endedAt).toBeUndefined();
+    expect(run?.endedReason).toBeUndefined();
+    expect(run?.outcome).toBeUndefined();
+    expect(run?.execution).toMatchObject({
+      status: "interrupted",
+      interruptedAt: Date.parse("2026-03-24T12:04:00Z"),
+      interruptionReason: "lost-execution-context",
+    });
+    expect(run?.execution?.endedAt).toBeUndefined();
+    expect(run?.execution?.outcome).toBeUndefined();
+    expect(mocks.persistSubagentRunsToDisk).toHaveBeenCalled();
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
+  it("terminalizes a fresh failed session without restart evidence", async () => {
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return { status: "pending" };
+      }
+      return {};
+    });
+    mocks.loadSessionStore.mockReturnValue({
+      "agent:main:subagent:child": {
+        sessionId: "sess-child",
+        updatedAt: Date.parse("2026-03-24T12:03:59Z"),
+        status: "failed",
+        abortedLastRun: false,
+      },
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-stale-nonresumable",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "do not replay an ordinary failed run",
+      cleanup: "keep",
+    });
+
+    vi.setSystemTime(new Date("2026-03-24T12:04:00Z"));
+    await mod.testing.sweepOnceForTests();
+
+    await waitForFast(() => {
+      expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    });
+    const run = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-stale-nonresumable");
+    expect(run?.endedAt).toBe(Date.parse("2026-03-24T12:03:59Z"));
+    expect(run?.endedReason).toBe(SUBAGENT_ENDED_REASON_ERROR);
+    expect(run?.outcome).toMatchObject({
+      status: "error",
+      error: "session completed before registry settled",
+    });
+    expect(mocks.scheduleOrphanRecovery).not.toHaveBeenCalled();
+  });
+
+  it("requeues a fresh failed session with durable restart evidence", async () => {
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return { status: "pending" };
+      }
+      return {};
+    });
+    mocks.loadSessionStore.mockReturnValue({
+      "agent:main:subagent:child": {
+        sessionId: "sess-child",
+        updatedAt: Date.parse("2026-03-24T12:04:01Z"),
+        status: "failed",
+        abortedLastRun: false,
+      },
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-stale-restart-failed",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "resume only with durable restart evidence",
+      cleanup: "keep",
+    });
+    const interrupted = mod.getSubagentRunByChildSessionKey("agent:main:subagent:child");
+    expect(interrupted).not.toBeNull();
+    if (interrupted) {
+      interrupted.execution = {
+        ...interrupted.execution,
+        status: "running",
+        outcome: {
+          status: "error",
+          error: "gateway closed (1012): service restart",
+        },
+      };
+    }
+
+    vi.setSystemTime(new Date("2026-03-24T12:04:02Z"));
+    await mod.testing.sweepOnceForTests();
+
+    await waitForFast(() => {
+      expectRecordFields(
+        getMockCallArg(mocks.scheduleOrphanRecovery, 0, 0, "orphan recovery"),
+        { delayMs: 1_000 },
+        "orphan recovery params",
+      );
+    });
+    const run = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-stale-restart-failed");
+    expect(run?.endedAt).toBeUndefined();
+    expect(run?.execution).toMatchObject({
+      status: "interrupted",
+      interruptionReason: "lost-execution-context",
+    });
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
   it("completes a registered run across timing persistence, lifecycle status, and announce cleanup", async () => {
     mod.registerSubagentRun({
       runId: "run-1",
@@ -4141,6 +4311,2018 @@ describe("subagent registry seam flow", () => {
       }),
     ]);
     expect(mocks.persistSubagentRunsToDisk).toHaveBeenCalled();
+  });
+
+  it("creates a fresh durable task generation for accepted orphan recovery", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) =>
+      request.method === "agent.wait" ? { status: "pending" } : {},
+    );
+    const oldRunId = "run-orphan-task-old";
+    const nextRunId = "run-orphan-task-next";
+    const childSessionKey = "agent:main:subagent:orphan-task-generation";
+    mod.registerSubagentRun({
+      runId: oldRunId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "continue after restart",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+    });
+    const oldTask = findTaskByRunIdForStatus(oldRunId);
+    const originalFlowId = oldTask?.parentFlowId;
+    expect(originalFlowId).toBeTypeOf("string");
+    finalizeTaskRunByRunId({
+      runId: oldRunId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      status: "failed",
+      endedAt: Date.now(),
+      error: "gateway closed (1012): service restart",
+    });
+    expect(getTaskFlowById(originalFlowId ?? "")?.status).toBe("failed");
+
+    expect(
+      mod.replaceSubagentRunAfterSteer({
+        previousRunId: oldRunId,
+        nextRunId,
+        createFreshTaskGeneration: true,
+      }),
+    ).toBe(true);
+
+    expect(findTaskByRunIdForStatus(oldRunId)).toMatchObject({ status: "failed" });
+    expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({
+      runId: nextRunId,
+      status: "running",
+      childSessionKey,
+      parentFlowId: originalFlowId,
+    });
+    expect(getTaskFlowById(originalFlowId ?? "")).toMatchObject({
+      flowId: originalFlowId,
+      status: "running",
+    });
+    expect(
+      mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === nextRunId),
+    ).toMatchObject({ runId: nextRunId, taskRunId: nextRunId });
+
+    finalizeTaskRunByRunId({
+      runId: nextRunId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      status: "succeeded",
+      endedAt: Date.now() + 1,
+    });
+    expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({ status: "succeeded" });
+    expect(getTaskFlowById(originalFlowId ?? "")?.status).toBe("succeeded");
+  });
+
+  it("keeps a recovered generation attached to its managed flow and parent task", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const oldRunId = "run-managed-flow-task-old";
+    const nextRunId = "run-managed-flow-task-next";
+    const childSessionKey = "agent:main:subagent:managed-flow-task";
+    const parentTaskId = "controller-parent-task";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "tests/recovered-subagent",
+      goal: "preserve child recovery ownership",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected managed flow creation to succeed");
+    }
+    const oldTask = runTaskInFlow({
+      flowId: flow.flowId,
+      runtime: "subagent",
+      runId: oldRunId,
+      childSessionKey,
+      parentTaskId,
+      task: "continue as the same managed child",
+      status: "running",
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+    expect(oldTask).toMatchObject({ found: true, created: true });
+    mod.addSubagentRunForTests({
+      runId: oldRunId,
+      taskRunId: oldRunId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "continue as the same managed child",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: Date.now(),
+      startedAt: Date.now(),
+    });
+    finalizeTaskRunByRunId({
+      runId: oldRunId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      status: "failed",
+      endedAt: Date.now(),
+      error: "gateway closed (1012): service restart",
+    });
+
+    expect(
+      mod.replaceSubagentRunAfterSteer({
+        previousRunId: oldRunId,
+        nextRunId,
+        createFreshTaskGeneration: true,
+      }),
+    ).toBe(true);
+
+    expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({
+      runId: nextRunId,
+      status: "running",
+      parentFlowId: flow.flowId,
+      parentTaskId,
+    });
+    expect(getTaskFlowById(flow.flowId)).toMatchObject({
+      flowId: flow.flowId,
+      status: "running",
+    });
+  });
+
+  it("repairs an active successor in the background after flow resume and task creation failure", async () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      mocks.callGateway.mockImplementation(async (request: { method?: string }) =>
+        request.method === "agent.wait" ? { status: "pending" } : {},
+      );
+      const oldRunId = "run-background-task-repair-old";
+      const nextRunId = "run-background-task-repair-next";
+      const childSessionKey = "agent:main:subagent:background-task-repair";
+      mod.registerSubagentRun({
+        runId: oldRunId,
+        childSessionKey,
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "repair task ownership while the successor remains active",
+        cleanup: "keep",
+        expectsCompletionMessage: true,
+      });
+      const oldTask = findTaskByRunIdForStatus(oldRunId);
+      const originalFlowId = oldTask?.parentFlowId;
+      expect(originalFlowId).toBeTypeOf("string");
+      finalizeTaskRunByRunId({
+        runId: oldRunId,
+        runtime: "subagent",
+        sessionKey: childSessionKey,
+        status: "failed",
+        endedAt: Date.now(),
+        error: "gateway closed (1012): service restart",
+      });
+      expect(getTaskFlowById(originalFlowId ?? "")?.status).toBe("failed");
+
+      const baseRuntime = getDetachedTaskLifecycleRuntime();
+      const createRunningTaskRunMock = vi
+        .fn(baseRuntime.createRunningTaskRun)
+        .mockReturnValueOnce(null);
+      setDetachedTaskLifecycleRuntime({
+        ...baseRuntime,
+        createRunningTaskRun: createRunningTaskRunMock,
+      });
+      expect(
+        mod.replaceSubagentRunAfterSteer({
+          previousRunId: oldRunId,
+          nextRunId,
+          createFreshTaskGeneration: true,
+        }),
+      ).toBe(true);
+
+      expect(getTaskFlowById(originalFlowId ?? "")?.status).toBe("running");
+      expect(findTaskByRunIdForStatus(nextRunId)).toBeUndefined();
+      expect(
+        mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId),
+      ).toMatchObject({
+        runId: nextRunId,
+        taskRunId: oldRunId,
+        taskGenerationRecovery: { runId: nextRunId, attemptCount: 1 },
+      });
+
+      // Multiple lookups in the same retry window must not amplify task
+      // creation or persistence attempts.
+      mocks.getAgentRunContext.mockImplementation((runId: string) =>
+        runId === nextRunId ? {} : undefined,
+      );
+      await mod.testing.sweepOnceForTests();
+      expect(createRunningTaskRunMock).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date(Date.now() + 60_001));
+      await mod.testing.sweepOnceForTests();
+
+      expect(createRunningTaskRunMock).toHaveBeenCalledTimes(2);
+      expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({
+        runId: nextRunId,
+        status: "running",
+        parentFlowId: originalFlowId,
+      });
+      expect(
+        mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId),
+      ).toMatchObject({ runId: nextRunId, taskRunId: nextRunId });
+      expect(
+        mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId)?.taskGenerationRecovery,
+      ).toBeUndefined();
+    } finally {
+      resetDetachedTaskLifecycleRuntimeForTests();
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+    }
+  });
+
+  it("queries exact Workboard recovery ownership through two durable successor generations", () => {
+    const childSessionKey = "agent:main:subagent:workboard-card-ownership";
+    const workspaceDir = "/tmp/workboard-card-worktree";
+    mod.addSubagentRunForTests({
+      runId: "workboard-run-r1",
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "continue the Workboard card",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      workspaceDir,
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      execution: {
+        status: "interrupted",
+        interruptedAt: 110,
+        interruptionReason: "gateway-restart",
+      },
+    });
+    expect(
+      mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === "workboard-run-r1")?.workspaceDir,
+    ).toBe(workspaceDir);
+
+    expect(
+      mod.claimSubagentOrphanRecovery({
+        predecessorRunId: "workboard-run-r1",
+        childSessionKey,
+        successorRunId: "workboard-run-r2",
+        claimedAt: 110,
+      }),
+    ).toEqual({ status: "claimed", successorRunId: "workboard-run-r2" });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-r1",
+      }),
+    ).toEqual({ status: "core_owned", successorRunId: "workboard-run-r2" });
+
+    expect(
+      mod.replaceSubagentRunAfterSteer({
+        previousRunId: "workboard-run-r1",
+        nextRunId: "workboard-run-r2",
+        requireDurableReplacement: true,
+      }),
+    ).toBe(true);
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-r1",
+      }),
+    ).toEqual({ status: "successor", successorRunId: "workboard-run-r2" });
+    expect(
+      mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === "workboard-run-r2")?.workspaceDir,
+    ).toBe(workspaceDir);
+
+    expect(
+      mod.claimSubagentOrphanRecovery({
+        predecessorRunId: "workboard-run-r2",
+        childSessionKey,
+        successorRunId: "workboard-run-r3",
+        claimedAt: 120,
+      }),
+    ).toEqual({ status: "claimed", successorRunId: "workboard-run-r3" });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-r1",
+      }),
+    ).toEqual({ status: "core_owned", successorRunId: "workboard-run-r3" });
+
+    expect(
+      mod.replaceSubagentRunAfterSteer({
+        previousRunId: "workboard-run-r2",
+        nextRunId: "workboard-run-r3",
+        requireDurableReplacement: true,
+      }),
+    ).toBe(true);
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-r1",
+      }),
+    ).toEqual({ status: "successor", successorRunId: "workboard-run-r3" });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-r2",
+      }),
+    ).toEqual({ status: "successor", successorRunId: "workboard-run-r3" });
+    expect(
+      mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === "workboard-run-r3")?.workspaceDir,
+    ).toBe(workspaceDir);
+  });
+
+  it("accepts and acknowledges verified completion after two Workboard run replacements", async () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const ownerKey = "agent:main:telegram:direct:kelly";
+    const childSessionKey = "agent:main:subagent:workboard-two-restarts";
+    const [firstRunId, secondRunId, finalRunId] = [
+      "workboard-two-restarts-r1",
+      "workboard-two-restarts-r2",
+      "workboard-two-restarts-r3",
+    ];
+    const flow = createManagedTaskFlow({
+      ownerKey,
+      requesterOrigin: { channel: "telegram", to: "kelly", accountId: "default" },
+      controllerId: "workboard",
+      goal: "finish after two Gateway restarts",
+      status: "blocked",
+      notifyPolicy: "silent",
+      currentStep: "worker",
+      waitJson: { kind: "workboard_worker", runId: firstRunId },
+      blockedSummary: `Waiting for Workboard worker ${firstRunId}.`,
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected two-restart Workboard flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey,
+        requesterOrigin: flow.requesterOrigin,
+        scopeKind: "session",
+        childSessionKey,
+        runId: firstRunId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "finish after two Gateway restarts",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId: firstRunId,
+      taskRunId: firstRunId,
+      childSessionKey,
+      controllerSessionKey: ownerKey,
+      requesterSessionKey: ownerKey,
+      requesterOrigin: flow.requesterOrigin,
+      requesterDisplayKey: "main",
+      task: "finish after two Gateway restarts",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      expectsCompletionMessage: false,
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      execution: {
+        status: "interrupted",
+        interruptedAt: 110,
+        interruptionReason: "gateway-restart",
+      },
+    });
+
+    const replaceAfterRestart = (predecessorRunId: string, successorRunId: string) => {
+      expect(
+        mod.claimSubagentOrphanRecovery({
+          predecessorRunId,
+          childSessionKey,
+          successorRunId,
+        }),
+      ).toMatchObject({ status: "claimed", successorRunId });
+      expect(
+        mod.replaceSubagentRunAfterSteer({
+          previousRunId: predecessorRunId,
+          nextRunId: successorRunId,
+          createFreshTaskGeneration: true,
+          requireDurableReplacement: true,
+        }),
+      ).toBe(true);
+      const current = getTaskFlowById(flow.flowId);
+      if (!current) {
+        throw new Error("expected Workboard flow after recovery replacement");
+      }
+      const waiting = updateFlowRecordByIdExpectedRevision({
+        flowId: current.flowId,
+        expectedRevision: current.revision,
+        patch: {
+          status: "blocked",
+          currentStep: "worker",
+          waitJson: { kind: "workboard_worker", runId: successorRunId },
+          blockedSummary: `Waiting for Workboard worker ${successorRunId}.`,
+        },
+      });
+      expect(waiting.applied).toBe(true);
+    };
+
+    replaceAfterRestart(firstRunId, secondRunId);
+    replaceAfterRestart(secondRunId, finalRunId);
+    mocks.getAgentRunContext.mockImplementation((runId: string) =>
+      runId === finalRunId ? { sessionKey: childSessionKey } : undefined,
+    );
+    expect(mod.hasDurableWorkboardCompletionOwnerForRequester(ownerKey)).toBe(true);
+    expect(
+      mod.hasDurableWorkboardCompletionOwnerForRequester("agent:main:telegram:direct:other"),
+    ).toBe(false);
+
+    const requirement = {
+      childSessionKey,
+      runId: finalRunId,
+      obligationId: "workboard:two-restarts:completion",
+      cardId: "workboard-two-restarts",
+      expectedRunId: finalRunId,
+      expectedRevision: "card-revision-after-r3",
+      claimOwnerId: "main",
+      summary: "Verified all durable steps exactly once.",
+      completionText: "Verified Workboard result: /tmp/workboard-two-restarts.txt",
+      proof: { id: "proof-two-restarts", status: "passed" as const, createdAt: 150 },
+      artifacts: [
+        {
+          id: "artifact-two-restarts",
+          createdAt: 150,
+          path: "/tmp/workboard-two-restarts.txt",
+          byteSize: 42,
+          sha256: "a".repeat(64),
+          verifiedAt: 150,
+        },
+      ],
+      createdCardIds: [],
+      flowId: flow.flowId,
+      flowOwnerSessionKey: ownerKey,
+      flowRevision: getTaskFlowById(flow.flowId)?.revision ?? 0,
+      controllerId: "workboard" as const,
+    };
+    expect(mod.requireWorkboardSubagentCompletionDelivery(requirement)).toMatchObject({
+      status: "armed",
+      deliveryStatus: "pending",
+    });
+    expect(mod.requireWorkboardSubagentCompletionDelivery(requirement)).toMatchObject({
+      status: "already_armed",
+    });
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        ...requirement,
+        summary: "Conflicting replacement result.",
+      }),
+    ).toMatchObject({ status: "unknown", error: "verified completion obligation conflicts" });
+
+    expect(findTaskByRunIdForStatus(firstRunId)).toMatchObject({ status: "failed" });
+    expect(findTaskByRunIdForStatus(secondRunId)).toMatchObject({ status: "failed" });
+    expect(findTaskByRunIdForStatus(finalRunId)).toMatchObject({ status: "running" });
+    expect(
+      listTaskRecords().filter(
+        (task) =>
+          task.parentFlowId === flow.flowId &&
+          task.childSessionKey === childSessionKey &&
+          (task.status === "queued" || task.status === "running"),
+      ),
+    ).toHaveLength(1);
+
+    // The provider can report an incomplete turn after workboard_complete has
+    // already persisted its verified intent. Reproduce that observed ordering:
+    // the ordinary lifecycle projection reaches failed first.
+    const lifecycleFailureAt = Date.now() + 1;
+    expect(
+      finalizeTaskRunByRunId({
+        runId: finalRunId,
+        runtime: "subagent",
+        sessionKey: childSessionKey,
+        status: "failed",
+        endedAt: lifecycleFailureAt,
+        lastEventAt: lifecycleFailureAt,
+        error: "Agent run failed",
+      }),
+    ).toHaveLength(1);
+    expect(findTaskByRunIdForStatus(finalRunId)).toMatchObject({
+      status: "failed",
+      error: "Agent run failed",
+    });
+
+    mocks.getAgentRunContext.mockReturnValue(undefined);
+    await mod.finalizeInterruptedSubagentRun({
+      runId: finalRunId,
+      childSessionKey,
+      error: "controlled stop after verified completion",
+      endedAt: lifecycleFailureAt + 1,
+    });
+    await waitForFast(() =>
+      expect(
+        mod.queryWorkboardSubagentRunState({ childSessionKey, runId: finalRunId }),
+      ).toMatchObject({
+        status: "terminal",
+        outcome: "ok",
+        deliveryStatus: "delivered",
+      }),
+    );
+    expect(findTaskByRunIdForStatus(finalRunId)).toMatchObject({ status: "succeeded" });
+    expect(
+      listTaskRecords().filter(
+        (task) =>
+          task.parentFlowId === flow.flowId &&
+          task.childSessionKey === childSessionKey &&
+          (task.status === "queued" || task.status === "running"),
+      ),
+    ).toHaveLength(0);
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    const deliveredFlow = getTaskFlowById(flow.flowId);
+    if (!deliveredFlow) {
+      throw new Error("expected delivered Workboard flow");
+    }
+    expect(
+      updateFlowRecordByIdExpectedRevision({
+        flowId: deliveredFlow.flowId,
+        expectedRevision: deliveredFlow.revision,
+        patch: { status: "succeeded", endedAt: 210 },
+      }).applied,
+    ).toBe(true);
+    expect(mod.hasDurableWorkboardCompletionOwnerForRequester(ownerKey)).toBe(false);
+  });
+
+  it("does not claim durable Workboard delivery for a terminal run without intent or a mismatched route", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+
+    const terminalOwnerKey = "agent:main:telegram:direct:terminal-without-intent";
+    const terminalChildSessionKey = "agent:main:subagent:terminal-without-intent";
+    const terminalRunId = "terminal-without-intent-run";
+    const terminalRoute = { channel: "telegram", to: "terminal-user", accountId: "default" };
+    const terminalFlow = createManagedTaskFlow({
+      ownerKey: terminalOwnerKey,
+      requesterOrigin: terminalRoute,
+      controllerId: "workboard",
+      goal: "do not suppress after terminal failure without an intent",
+      status: "blocked",
+      notifyPolicy: "silent",
+      blockedSummary: "Waiting for a stale task row.",
+    });
+    expect(terminalFlow).not.toBeNull();
+    if (!terminalFlow) {
+      throw new Error("expected terminal/no-intent Workboard flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: terminalOwnerKey,
+        requesterOrigin: terminalRoute,
+        scopeKind: "session",
+        childSessionKey: terminalChildSessionKey,
+        runId: terminalRunId,
+        parentFlowId: terminalFlow.flowId,
+        label: "plugin:workboard",
+        task: "terminal without verified intent",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId: terminalRunId,
+      taskRunId: terminalRunId,
+      childSessionKey: terminalChildSessionKey,
+      controllerSessionKey: terminalOwnerKey,
+      requesterSessionKey: terminalOwnerKey,
+      requesterOrigin: terminalRoute,
+      requesterDisplayKey: "main",
+      task: "terminal without verified intent",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      expectsCompletionMessage: false,
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      endedAt: 120,
+      outcome: { status: "error", error: "terminal before verified completion" },
+      execution: {
+        status: "terminal",
+        startedAt: 100,
+        endedAt: 120,
+        outcome: { status: "error", error: "terminal before verified completion" },
+      },
+    });
+    expect(mod.hasDurableWorkboardCompletionOwnerForRequester(terminalOwnerKey)).toBe(false);
+
+    const mismatchOwnerKey = "agent:main:telegram:direct:route-mismatch";
+    const mismatchChildSessionKey = "agent:main:subagent:route-mismatch";
+    const mismatchRunId = "route-mismatch-run";
+    const flowRoute = { channel: "telegram", to: "expected-user", accountId: "default" };
+    const mismatchFlow = createManagedTaskFlow({
+      ownerKey: mismatchOwnerKey,
+      requesterOrigin: flowRoute,
+      controllerId: "workboard",
+      goal: "do not suppress for a different requester route",
+      status: "blocked",
+      notifyPolicy: "silent",
+      blockedSummary: "Waiting for a differently routed worker.",
+    });
+    expect(mismatchFlow).not.toBeNull();
+    if (!mismatchFlow) {
+      throw new Error("expected route-mismatch Workboard flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: mismatchOwnerKey,
+        requesterOrigin: flowRoute,
+        scopeKind: "session",
+        childSessionKey: mismatchChildSessionKey,
+        runId: mismatchRunId,
+        parentFlowId: mismatchFlow.flowId,
+        label: "plugin:workboard",
+        task: "active worker with mismatched requester route",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId: mismatchRunId,
+      taskRunId: mismatchRunId,
+      childSessionKey: mismatchChildSessionKey,
+      controllerSessionKey: mismatchOwnerKey,
+      requesterSessionKey: mismatchOwnerKey,
+      requesterOrigin: { channel: "telegram", to: "different-user", accountId: "default" },
+      requesterDisplayKey: "main",
+      task: "active worker with mismatched requester route",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      expectsCompletionMessage: false,
+      generation: 1,
+      createdAt: 200,
+      startedAt: 200,
+      execution: { status: "running", startedAt: 200 },
+    });
+    expect(mod.hasDurableWorkboardCompletionOwnerForRequester(mismatchOwnerKey)).toBe(false);
+  });
+
+  it("fails closed for unknown recovery ownership and exposes durable exhaustion", () => {
+    const childSessionKey = "agent:main:subagent:workboard-card-exhausted";
+    mod.addSubagentRunForTests({
+      runId: "workboard-run-exhausted",
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "exhaust this Workboard recovery",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-exhausted",
+      }),
+    ).toEqual({ status: "unknown" });
+
+    expect(
+      mod.claimSubagentOrphanRecovery({
+        predecessorRunId: "workboard-run-exhausted",
+        childSessionKey,
+        successorRunId: "workboard-run-never-started",
+        claimedAt: 110,
+      }),
+    ).toMatchObject({ status: "claimed" });
+    expect(
+      mod.markSubagentOrphanRecoveryExhausted({
+        predecessorRunId: "workboard-run-exhausted",
+        childSessionKey,
+        error: "gateway unavailable with secret details",
+        settledAt: 120,
+      }),
+    ).toBe(true);
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-exhausted",
+      }),
+    ).toEqual({
+      status: "exhausted",
+      error: "automatic subagent recovery exhausted",
+    });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey: "agent:main:subagent:wrong-session",
+        predecessorRunId: "workboard-run-exhausted",
+      }),
+    ).toEqual({ status: "unknown" });
+
+    mod.addSubagentRunForTests({
+      runId: "non-workboard-latest",
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "untrusted latest generation",
+      cleanup: "keep",
+      label: "plugin:other",
+      generation: 2,
+      createdAt: 200,
+      startedAt: 200,
+    });
+    expect(
+      mod.querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-run-exhausted",
+      }),
+    ).toEqual({ status: "unknown" });
+  });
+
+  it("reports an exact trusted Workboard registry run as active without task evidence", () => {
+    const childSessionKey = "agent:main:subagent:workboard-state-active";
+    const runtime = getDetachedTaskLifecycleRuntime();
+    setDetachedTaskLifecycleRuntime({ ...runtime, findTaskRun: () => undefined });
+    mod.addSubagentRunForTests({
+      runId: "workboard-state-active",
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "active Workboard state",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-active" }),
+    ).toEqual({ status: "active" });
+    expect(
+      mod.queryWorkboardSubagentRunState({
+        childSessionKey: "agent:main:subagent:wrong-session",
+        runId: "workboard-state-active",
+      }),
+    ).toEqual({ status: "unknown" });
+  });
+
+  it("durably freezes and delivers one structured Workboard completion despite late worker output", async () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:workboard-verified-completion";
+    const runId = "workboard-verified-completion";
+    const requesterSessionKey = "agent:main:telegram:direct:kelly";
+    const requesterOrigin = { channel: "telegram", to: "kelly", accountId: "default" };
+    const flow = createManagedTaskFlow({
+      ownerKey: requesterSessionKey,
+      requesterOrigin,
+      controllerId: "workboard",
+      goal: "finish a verified Workboard card",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected verified completion managed flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: requesterSessionKey,
+        requesterOrigin,
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "finish a verified Workboard card",
+      }),
+    ).not.toBeNull();
+    let resolveDelivery: (delivered: boolean) => void = () => {};
+    mocks.runSubagentAnnounceFlow.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveDelivery = resolve;
+        }),
+    );
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      controllerSessionKey: requesterSessionKey,
+      requesterSessionKey,
+      requesterOrigin,
+      requesterDisplayKey: "main",
+      task: "finish a verified Workboard card",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      endedAt: 150,
+      endedReason: SUBAGENT_ENDED_REASON_ERROR,
+      outcome: { status: "error", error: "late provider failure" },
+      execution: {
+        status: "terminal",
+        startedAt: 100,
+        endedAt: 150,
+        outcome: { status: "error", error: "late provider failure" },
+      },
+      completion: { required: false, resultText: null, capturedAt: 150 },
+      delivery: { status: "not_required" },
+      expectsCompletionMessage: false,
+      cleanupHandled: true,
+      cleanupCompletedAt: 151,
+    });
+
+    const requirement = {
+      childSessionKey,
+      runId,
+      obligationId: "workboard:card-verified:completion",
+      cardId: "card-verified",
+      expectedRunId: runId,
+      expectedRevision: "card-revision-7",
+      claimOwnerId: "cairn",
+      // Simulate an untrusted extra field crossing a JavaScript call boundary.
+      // Core must never spread or persist this raw worker claim credential.
+      claimToken: "raw-claim-token-must-not-persist",
+      requesterSessionKey: "agent:other:telegram:direct:attacker",
+      requesterOrigin: { channel: "telegram", to: "attacker" },
+      summary: "Verified the durable output.",
+      completionText: "Verified Workboard result: /tmp/workboard-result.txt",
+      proof: {
+        id: "proof-1",
+        status: "passed" as const,
+        createdAt: 140,
+        command: "pnpm test",
+        note: "all checks passed",
+      },
+      artifacts: [
+        {
+          id: "artifact-1",
+          createdAt: 141,
+          path: "/tmp/workboard-result.txt",
+          byteSize: 42,
+          sha256: "a".repeat(64),
+          verifiedAt: 145,
+          label: "result",
+        },
+      ],
+      createdCardIds: ["child-card-1"],
+      flowId: flow.flowId,
+      flowOwnerSessionKey: requesterSessionKey,
+      flowRevision: 4,
+      controllerId: "workboard" as const,
+    };
+    const otherFlow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "another Workboard card",
+      status: "running",
+    });
+    expect(otherFlow).not.toBeNull();
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        ...requirement,
+        flowId: otherFlow?.flowId ?? "missing-other-flow",
+      }),
+    ).toEqual({
+      status: "unknown",
+      error: "verified completion flow linkage is unavailable",
+    });
+    const armed = mod.requireWorkboardSubagentCompletionDelivery(requirement);
+    expect(armed).toMatchObject({
+      status: "armed",
+      deliveryStatus: "pending",
+      verifiedCompletionIntent: {
+        kind: "verified_workboard_completion",
+        obligationId: requirement.obligationId,
+        cardId: requirement.cardId,
+        childSessionKey,
+        runId,
+        expectedRunId: runId,
+        expectedRevision: requirement.expectedRevision,
+        claimOwnerId: "cairn",
+        summary: requirement.summary,
+        completionText: requirement.completionText,
+        proof: requirement.proof,
+        artifacts: requirement.artifacts,
+        createdCardIds: requirement.createdCardIds,
+        flowId: requirement.flowId,
+        flowOwnerSessionKey: requirement.flowOwnerSessionKey,
+        requesterSessionKey,
+        requesterOrigin,
+        flowRevision: 4,
+        controllerId: "workboard",
+      },
+    });
+    expect(JSON.stringify(armed)).not.toContain("raw-claim-token-must-not-persist");
+    const persistedRuns = getMockCallArg(
+      mocks.persistSubagentRunsToDiskOrThrow,
+      0,
+      0,
+      "verified completion registry persist",
+    ) as Map<string, unknown>;
+    expect(JSON.stringify([...persistedRuns.values()])).not.toContain(
+      "raw-claim-token-must-not-persist",
+    );
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      status: "terminal",
+      outcome: "ok",
+      deliveryStatus: "pending",
+      deliveryObligationId: requirement.obligationId,
+      verifiedCompletionIntent:
+        armed.status === "unknown" ? undefined : armed.verifiedCompletionIntent,
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    expect(getMockCallArg(mocks.runSubagentAnnounceFlow, 0, 0, "verified announce")).toMatchObject({
+      childSessionKey,
+      childRunId: runId,
+      deliveryObligationId: requirement.obligationId,
+      requesterSessionKey,
+      requesterOrigin,
+      roundOneReply: requirement.completionText,
+      outcome: { status: "ok" },
+    });
+
+    mocks.captureSubagentCompletionReply.mockResolvedValueOnce("arbitrary later child output");
+    await mod.finalizeInterruptedSubagentRun({
+      runId,
+      childSessionKey,
+      error: "worker failed after the verified result was armed",
+      endedAt: 300,
+    });
+    const afterLateError = mod
+      .listSubagentRunsForRequester(requesterSessionKey)
+      .find((entry) => entry.runId === runId);
+    expect(afterLateError?.completion?.resultText).toBe(requirement.completionText);
+    expect(afterLateError?.outcome?.status).toBe("ok");
+    expect(afterLateError?.delivery?.payload?.frozenResultText).toBe(requirement.completionText);
+    expect(await mod.testing.refreshFrozenResultFromSessionForTests(childSessionKey)).toBe(false);
+    expect(
+      mod.listSubagentRunsForRequester(requesterSessionKey).find((entry) => entry.runId === runId)
+        ?.completion?.resultText,
+    ).toBe(requirement.completionText);
+    expect(
+      mod.replaceSubagentRunAfterSteer({ previousRunId: runId, nextRunId: "forbidden-successor" }),
+    ).toBe(false);
+    expect(
+      mod.claimSubagentOrphanRecovery({
+        predecessorRunId: runId,
+        childSessionKey,
+        successorRunId: "forbidden-successor",
+      }),
+    ).toMatchObject({ status: "unavailable" });
+
+    const retried = mod.requireWorkboardSubagentCompletionDelivery({
+      ...requirement,
+      // These are mutable hints and must not create a second obligation.
+      expectedRevision: "revision-after-benign-heartbeat",
+      flowRevision: 5,
+    });
+    expect(retried).toMatchObject({
+      status: "already_armed",
+      verifiedCompletionIntent:
+        armed.status === "unknown" ? undefined : armed.verifiedCompletionIntent,
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        ...requirement,
+        summary: "conflicting payload for the same obligation",
+      }),
+    ).toMatchObject({ status: "unknown" });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+
+    resolveDelivery(true);
+    await waitForFast(() =>
+      expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+        status: "terminal",
+        outcome: "ok",
+        deliveryStatus: "delivered",
+      }),
+    );
+    expect(mod.requireWorkboardSubagentCompletionDelivery(requirement)).toMatchObject({
+      status: "delivered",
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+  });
+
+  it("rolls back a Workboard completion arm when its durable intent cannot be persisted", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:workboard-arm-persist-failure";
+    const runId = "workboard-arm-persist-failure";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "persist the verified completion",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected persistence test managed flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "remain resumable until the completion obligation is durable",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "remain resumable until the completion obligation is durable",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+      throw new Error("disk unavailable");
+    });
+
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        childSessionKey,
+        runId,
+        obligationId: "workboard:card-persist-failure:completion",
+        cardId: "card-persist-failure",
+        expectedRunId: runId,
+        expectedRevision: "card-revision-1",
+        claimOwnerId: "cairn",
+        summary: "not durable yet",
+        completionText: "not durable yet",
+        proof: { id: "proof-1", status: "passed", createdAt: 100 },
+        artifacts: [
+          {
+            id: "artifact-1",
+            createdAt: 100,
+            path: "/tmp/not-durable.txt",
+            byteSize: 1,
+            sha256: "b".repeat(64),
+            verifiedAt: 100,
+          },
+        ],
+        createdCardIds: [],
+        flowId: flow.flowId,
+        flowOwnerSessionKey: "agent:main:main",
+        flowRevision: 0,
+        controllerId: "workboard",
+      }),
+    ).toEqual({
+      status: "unknown",
+      error: "verified completion intent could not be persisted",
+    });
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toEqual({
+      status: "active",
+    });
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
+  it("waits for physical execution end before delivering an in-turn verified completion", async () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:active-completion-request";
+    const runId = "active-completion-request";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "stop after the verified completion tool",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected active completion flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "stop after the verified completion tool",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "stop after the verified completion tool",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      execution: { status: "running", startedAt: 100 },
+    });
+    mocks.getAgentRunContext.mockReturnValue({ sessionKey: childSessionKey });
+    const completionText = "verified result frozen before the turn exits";
+
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        childSessionKey,
+        runId,
+        obligationId: "workboard:active-request:completion",
+        cardId: "active-request",
+        expectedRunId: runId,
+        expectedRevision: "revision-1",
+        claimOwnerId: "cairn",
+        summary: "verified",
+        completionText,
+        proof: { id: "proof-1", status: "passed", createdAt: 100 },
+        artifacts: [
+          {
+            id: "artifact-1",
+            createdAt: 100,
+            path: "/tmp/active-request.txt",
+            byteSize: 1,
+            sha256: "f".repeat(64),
+            verifiedAt: 100,
+          },
+        ],
+        createdCardIds: [],
+        flowId: flow.flowId,
+        flowOwnerSessionKey: "agent:main:main",
+        flowRevision: flow.revision,
+        controllerId: "workboard",
+      }),
+    ).toMatchObject({ status: "armed", deliveryStatus: "pending" });
+    expect(findTaskByRunIdForStatus(runId)).toMatchObject({ status: "running" });
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      status: "active",
+      deliveryStatus: "pending",
+    });
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+    const armedEntry = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === runId);
+    expect(armedEntry?.endedAt).toBeUndefined();
+    expect(armedEntry?.execution).toMatchObject({ status: "running" });
+
+    mocks.getAgentRunContext.mockReturnValue(undefined);
+    mocks.runSubagentAnnounceFlow.mockReturnValueOnce(new Promise(() => {}));
+    const executionEndedAt = Date.now() + 1;
+    await mod.finalizeInterruptedSubagentRun({
+      runId,
+      childSessionKey,
+      error: "controlled stop after verified completion",
+      endedAt: executionEndedAt,
+    });
+
+    expect(findTaskByRunIdForStatus(runId)).toMatchObject({ status: "succeeded" });
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      status: "terminal",
+      outcome: "ok",
+      deliveryStatus: "pending",
+    });
+    expect(findTaskByRunIdForStatus(runId)).toMatchObject({
+      status: "succeeded",
+      terminalSummary: completionText,
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    expect(
+      getMockCallArg(mocks.runSubagentAnnounceFlow, 0, 0, "post-execution announce"),
+    ).toMatchObject({
+      deliveryObligationId: "workboard:active-request:completion",
+      roundOneReply: completionText,
+      outcome: { status: "ok" },
+    });
+  });
+
+  it("rejects a completion linked to a managed flow owned by another controller", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:wrong-flow-controller";
+    const runId = "wrong-flow-controller";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "another-controller",
+      goal: "not a Workboard flow",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected non-Workboard managed flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "do not arm this result",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "do not arm this result",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        childSessionKey,
+        runId,
+        obligationId: "workboard:wrong-controller:completion",
+        cardId: "wrong-controller",
+        expectedRunId: runId,
+        expectedRevision: "revision-1",
+        claimOwnerId: "cairn",
+        summary: "must be rejected",
+        completionText: "must be rejected",
+        proof: { id: "proof-1", status: "passed", createdAt: 100 },
+        artifacts: [
+          {
+            id: "artifact-1",
+            createdAt: 100,
+            path: "/tmp/wrong-controller.txt",
+            byteSize: 1,
+            sha256: "c".repeat(64),
+            verifiedAt: 100,
+          },
+        ],
+        createdCardIds: [],
+        flowId: flow.flowId,
+        flowOwnerSessionKey: "agent:main:main",
+        flowRevision: flow.revision,
+        controllerId: "workboard",
+      }),
+    ).toEqual({
+      status: "unknown",
+      error: "verified completion flow linkage is unavailable",
+    });
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
+  it("rejects a verified completion arm after its managed flow was cancelled", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:cancel-before-workboard-arm";
+    const runId = "cancel-before-workboard-arm";
+    const ownerKey = "agent:main:main";
+    const flow = createManagedTaskFlow({
+      ownerKey,
+      controllerId: "workboard",
+      goal: "cancel before accepting completion",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected pre-arm cancellation flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey,
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "must stay cancelled",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      controllerSessionKey: ownerKey,
+      requesterSessionKey: ownerKey,
+      requesterDisplayKey: "main",
+      task: "must stay cancelled",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    const requested = requestFlowCancel({
+      flowId: flow.flowId,
+      expectedRevision: flow.revision,
+      cancelRequestedAt: 120,
+    });
+    expect(requested.applied).toBe(true);
+    if (!requested.applied) {
+      throw new Error("expected pre-arm cancel request to persist");
+    }
+    const cancelled = updateFlowRecordByIdExpectedRevision({
+      flowId: flow.flowId,
+      expectedRevision: requested.flow.revision,
+      patch: { status: "cancelled", endedAt: 120, updatedAt: 120 },
+    });
+    expect(cancelled.applied).toBe(true);
+    if (!cancelled.applied) {
+      throw new Error("expected pre-arm flow cancellation to finalize");
+    }
+
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        childSessionKey,
+        runId,
+        obligationId: "workboard:cancel-before-arm:completion",
+        cardId: "cancel-before-arm",
+        expectedRunId: runId,
+        expectedRevision: "revision-1",
+        claimOwnerId: "cairn",
+        summary: "must be rejected",
+        completionText: "must be rejected",
+        proof: { id: "proof-1", status: "passed", createdAt: 110 },
+        artifacts: [
+          {
+            id: "artifact-1",
+            createdAt: 110,
+            path: "/tmp/cancel-before-arm.txt",
+            byteSize: 1,
+            sha256: "d".repeat(64),
+            verifiedAt: 110,
+          },
+        ],
+        createdCardIds: [],
+        flowId: flow.flowId,
+        flowOwnerSessionKey: ownerKey,
+        flowRevision: cancelled.flow.revision,
+        controllerId: "workboard",
+      }),
+    ).toEqual({
+      status: "unknown",
+      error: "verified completion flow linkage is unavailable",
+    });
+    expect(getTaskFlowById(flow.flowId)).toMatchObject({
+      status: "cancelled",
+      cancelRequestedAt: 120,
+    });
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toEqual({
+      status: "active",
+    });
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a verified intent whose task projection failed after the durable arm", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:completion-projection-reconcile";
+    const runId = "completion-projection-reconcile";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "reconcile the task projection",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected projection reconciliation flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "reconcile the task projection",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "reconcile the task projection",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    const runtime = getDetachedTaskLifecycleRuntime();
+    setDetachedTaskLifecycleRuntime({
+      ...runtime,
+      reconcileVerifiedWorkboardCompletion: () => {
+        throw new Error("simulated crash window after intent persistence");
+      },
+    });
+    mocks.runSubagentAnnounceFlow.mockReturnValueOnce(new Promise(() => {}));
+    const requirement = {
+      childSessionKey,
+      runId,
+      obligationId: "workboard:projection-reconcile:completion",
+      cardId: "projection-reconcile",
+      expectedRunId: runId,
+      expectedRevision: "revision-1",
+      claimOwnerId: "cairn",
+      summary: "verified",
+      completionText: "verified projection result",
+      proof: { id: "proof-1", status: "passed" as const, createdAt: 100 },
+      artifacts: [
+        {
+          id: "artifact-1",
+          createdAt: 100,
+          path: "/tmp/projection-reconcile.txt",
+          byteSize: 1,
+          sha256: "d".repeat(64),
+          verifiedAt: 100,
+        },
+      ],
+      createdCardIds: [],
+      flowId: flow.flowId,
+      flowOwnerSessionKey: "agent:main:main",
+      flowRevision: flow.revision,
+      controllerId: "workboard" as const,
+    };
+
+    expect(mod.requireWorkboardSubagentCompletionDelivery(requirement)).toMatchObject({
+      status: "armed",
+    });
+    expect(findTaskByRunIdForStatus(runId)).toMatchObject({ status: "running" });
+
+    resetDetachedTaskLifecycleRuntimeForTests();
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      status: "terminal",
+      outcome: "ok",
+    });
+    expect(findTaskByRunIdForStatus(runId)).toMatchObject({
+      status: "succeeded",
+      parentFlowId: flow.flowId,
+      terminalSummary: requirement.completionText,
+    });
+  });
+
+  it("re-arms one suspended verified obligation on reconciliation", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:suspended-verified-delivery";
+    const runId = "suspended-verified-delivery";
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "resume verified delivery",
+      status: "running",
+    });
+    expect(flow).not.toBeNull();
+    if (!flow) {
+      throw new Error("expected suspended delivery flow");
+    }
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "resume verified delivery",
+      }),
+    ).not.toBeNull();
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "resume verified delivery",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    mocks.runSubagentAnnounceFlow.mockReturnValueOnce(new Promise(() => {}));
+    const obligationId = "workboard:suspended-delivery:completion";
+    expect(
+      mod.requireWorkboardSubagentCompletionDelivery({
+        childSessionKey,
+        runId,
+        obligationId,
+        cardId: "suspended-delivery",
+        expectedRunId: runId,
+        expectedRevision: "revision-1",
+        claimOwnerId: "cairn",
+        summary: "verified",
+        completionText: "verified suspended result",
+        proof: { id: "proof-1", status: "passed", createdAt: 100 },
+        artifacts: [
+          {
+            id: "artifact-1",
+            createdAt: 100,
+            path: "/tmp/suspended-delivery.txt",
+            byteSize: 1,
+            sha256: "e".repeat(64),
+            verifiedAt: 100,
+          },
+        ],
+        createdCardIds: [],
+        flowId: flow.flowId,
+        flowOwnerSessionKey: "agent:main:main",
+        flowRevision: flow.revision,
+        controllerId: "workboard",
+      }),
+    ).toMatchObject({ status: "armed" });
+    const entry = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((candidate) => candidate.runId === runId);
+    expect(entry).toBeDefined();
+    if (!entry?.delivery) {
+      throw new Error("expected verified delivery state");
+    }
+    entry.delivery.status = "suspended";
+    entry.delivery.suspendedAt = Date.now();
+    entry.delivery.suspendedReason = "retry-limit";
+    entry.delivery.attemptCount = 10;
+    entry.cleanupHandled = false;
+    mocks.runSubagentAnnounceFlow.mockClear();
+
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      deliveryStatus: "pending",
+      deliveryObligationId: obligationId,
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+    expect(
+      getMockCallArg(mocks.runSubagentAnnounceFlow, 0, 0, "resumed verified announce"),
+    ).toMatchObject({
+      childSessionKey,
+      childRunId: runId,
+      deliveryObligationId: obligationId,
+    });
+    mod.queryWorkboardSubagentRunState({ childSessionKey, runId });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports exact Workboard task terminal state and sanitizes its error", () => {
+    resetTaskRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:workboard-state-terminal";
+    const runId = "workboard-state-terminal";
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        label: "plugin:workboard",
+        task: "terminal Workboard state",
+      }),
+    ).not.toBeNull();
+    finalizeTaskRunByRunId({
+      runId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      status: "failed",
+      endedAt: 200,
+      error: "provider   failed",
+    });
+
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId })).toEqual({
+      status: "terminal",
+      outcome: "error",
+      error: "provider failed",
+    });
+  });
+
+  it("rejects a cold stale Workboard task when a newer task generation exists", () => {
+    resetTaskRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:workboard-task-only-generations";
+    vi.setSystemTime(new Date("2026-03-24T12:00:00Z"));
+    createRunningTaskRun({
+      runtime: "subagent",
+      ownerKey: "agent:main:main",
+      scopeKind: "session",
+      childSessionKey,
+      runId: "workboard-task-only-r1",
+      label: "plugin:workboard",
+      task: "old task-only generation",
+    });
+    finalizeTaskRunByRunId({
+      runId: "workboard-task-only-r1",
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      status: "succeeded",
+      endedAt: Date.now() + 1,
+    });
+    vi.setSystemTime(new Date("2026-03-24T12:00:01Z"));
+    createRunningTaskRun({
+      runtime: "subagent",
+      ownerKey: "agent:main:main",
+      scopeKind: "session",
+      childSessionKey,
+      runId: "workboard-task-only-r2",
+      label: "plugin:workboard",
+      task: "new task-only generation",
+    });
+
+    expect(
+      mod.queryWorkboardSubagentRunState({
+        childSessionKey,
+        runId: "workboard-task-only-r1",
+      }),
+    ).toEqual({ status: "unknown" });
+  });
+
+  it("distinguishes exact durable absence from unavailable or mismatched evidence", () => {
+    const childSessionKey = "agent:main:subagent:workboard-state-absent";
+    const runtime = getDetachedTaskLifecycleRuntime();
+    setDetachedTaskLifecycleRuntime({ ...runtime, findTaskRun: () => undefined });
+
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-missing" }),
+    ).toEqual({ status: "absent" });
+
+    setDetachedTaskLifecycleRuntime({
+      ...runtime,
+      findTaskRun: () => {
+        throw new Error("task store unavailable");
+      },
+    });
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-missing" }),
+    ).toEqual({ status: "unknown" });
+
+    setDetachedTaskLifecycleRuntime({ ...runtime, findTaskRun: () => undefined });
+    mocks.getSubagentRunsSnapshotForReadStrict.mockImplementation(() => {
+      throw new Error("registry store unavailable");
+    });
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-missing" }),
+    ).toEqual({ status: "unknown" });
+  });
+
+  it("rejects wrong-label and ambiguous detached task identities", () => {
+    const childSessionKey = "agent:main:subagent:workboard-state-mismatch";
+    const runtime = getDetachedTaskLifecycleRuntime();
+    setDetachedTaskLifecycleRuntime({
+      ...runtime,
+      findTaskRun: (params) => ({
+        taskId: "wrong-task",
+        runtime: "subagent",
+        requesterSessionKey: "agent:main:main",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: params.sessionKey,
+        runId: params.runId,
+        label: "plugin:other",
+        task: "wrong plugin task",
+        status: "running",
+        deliveryStatus: "pending",
+        notifyPolicy: "done_only",
+        createdAt: 100,
+      }),
+    });
+
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-mismatch" }),
+    ).toEqual({ status: "unknown" });
+  });
+
+  it("rejects a stale Workboard predecessor but proves a new exact retry id absent", () => {
+    resetTaskRegistryForTests({ persist: false });
+    const childSessionKey = "agent:main:subagent:workboard-state-generations";
+    expect(
+      createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey,
+        runId: "workboard-state-r1",
+        label: "plugin:workboard",
+        task: "old Workboard generation",
+      }),
+    ).not.toBeNull();
+    for (const [runId, generation] of [
+      ["workboard-state-r1", 1],
+      ["workboard-state-r2", 2],
+    ] as const) {
+      mod.addSubagentRunForTests({
+        runId,
+        childSessionKey,
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "Workboard generation",
+        cleanup: "keep",
+        label: "plugin:workboard",
+        generation,
+        createdAt: generation * 100,
+        startedAt: generation * 100,
+      });
+    }
+
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-r1" }),
+    ).toEqual({ status: "unknown" });
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: "workboard-state-r3" }),
+    ).toEqual({ status: "absent" });
+  });
+
+  it("trusts an exact core-owned pending Workboard successor with active context", () => {
+    const childSessionKey = "agent:main:subagent:workboard-state-pending";
+    const predecessorRunId = "workboard-state-predecessor";
+    const successorRunId = "workboard-state-pending-successor";
+    mod.addSubagentRunForTests({
+      runId: predecessorRunId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "pending Workboard successor",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    expect(
+      mod.claimSubagentOrphanRecovery({
+        predecessorRunId,
+        childSessionKey,
+        successorRunId,
+      }),
+    ).toMatchObject({ status: "claimed", successorRunId });
+    expect(
+      mod.queryWorkboardSubagentRunState({ childSessionKey, runId: predecessorRunId }),
+    ).toEqual({ status: "unknown" });
+    mocks.getAgentRunContext.mockImplementation((runId: string) =>
+      runId === successorRunId ? { sessionKey: childSessionKey } : undefined,
+    );
+
+    expect(mod.queryWorkboardSubagentRunState({ childSessionKey, runId: successorRunId })).toEqual({
+      status: "active",
+    });
+  });
+
+  it("durably exhausts preclaimed ownership when the recovery module cannot load", async () => {
+    const childSessionKey = "agent:main:subagent:workboard-import-failure";
+    const runId = "workboard-import-failure";
+    mod.addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "fail loading orphan recovery",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      execution: {
+        status: "interrupted",
+        interruptedAt: 110,
+        interruptionReason: "gateway-restart",
+      },
+    });
+    mod.testing.setDepsForTest({
+      loadOrphanRecoveryModule: async () => {
+        throw new Error("module import failed");
+      },
+    });
+
+    mod.scheduleSubagentOrphanRecovery({ delayMs: 5_000, maxRetries: 0 });
+
+    await waitForFast(() =>
+      expect(
+        mod.querySubagentRecoveryOwnership({ childSessionKey, predecessorRunId: runId }),
+      ).toEqual({
+        status: "exhausted",
+        error: "automatic subagent recovery exhausted",
+      }),
+    );
+  });
+
+  it.each(["returns null", "throws"] as const)(
+    "keeps the live successor durably repairable when task generation %s",
+    (failureMode) => {
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+      try {
+        mocks.callGateway.mockImplementation(async (request: { method?: string }) =>
+          request.method === "agent.wait" ? { status: "pending" } : {},
+        );
+        const oldRunId = `run-orphan-task-failure-old-${failureMode}`;
+        const nextRunId = `run-orphan-task-failure-next-${failureMode}`;
+        const childSessionKey = `agent:main:subagent:orphan-task-failure-${failureMode}`;
+        mod.registerSubagentRun({
+          runId: oldRunId,
+          childSessionKey,
+          requesterSessionKey: "agent:main:main",
+          requesterDisplayKey: "main",
+          task: "preserve the accepted successor while task persistence recovers",
+          cleanup: "keep",
+          expectsCompletionMessage: false,
+        });
+        finalizeTaskRunByRunId({
+          runId: oldRunId,
+          runtime: "subagent",
+          sessionKey: childSessionKey,
+          status: "failed",
+          endedAt: Date.now(),
+          error: "gateway closed (1012): service restart",
+        });
+
+        const baseRuntime = getDetachedTaskLifecycleRuntime();
+        const createRunningTaskRunMock = vi.fn(baseRuntime.createRunningTaskRun);
+        if (failureMode === "returns null") {
+          createRunningTaskRunMock.mockReturnValueOnce(null);
+        } else {
+          createRunningTaskRunMock.mockImplementationOnce(() => {
+            throw new Error("task registry temporarily unavailable");
+          });
+        }
+        setDetachedTaskLifecycleRuntime({
+          ...baseRuntime,
+          createRunningTaskRun: createRunningTaskRunMock,
+        });
+
+        expect(
+          mod.replaceSubagentRunAfterSteer({
+            previousRunId: oldRunId,
+            nextRunId,
+            createFreshTaskGeneration: true,
+          }),
+        ).toBe(true);
+
+        let successor = mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId);
+        expect(successor).toMatchObject({
+          runId: nextRunId,
+          taskRunId: oldRunId,
+          taskGenerationRecovery: {
+            runId: nextRunId,
+            attemptCount: 1,
+          },
+        });
+        expect(findTaskByRunIdForStatus(nextRunId)).toBeUndefined();
+
+        // Lifecycle lookups inside terminalization must honor the retry
+        // backoff and must target the accepted successor, never its failed
+        // predecessor task row.
+        expect(mod.markSubagentRunTerminated({ runId: nextRunId, reason: "killed" })).toBe(1);
+        expect(createRunningTaskRunMock).toHaveBeenCalledTimes(1);
+        expect(findTaskByRunIdForStatus(oldRunId)).toMatchObject({ status: "failed" });
+        expect(findTaskByRunIdForStatus(nextRunId)).toBeUndefined();
+        successor = mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId);
+        expect(successor).toMatchObject({
+          taskRunId: oldRunId,
+          taskGenerationRecovery: { runId: nextRunId, attemptCount: 1 },
+          endedReason: SUBAGENT_ENDED_REASON_KILLED,
+        });
+
+        vi.setSystemTime(new Date(Date.now() + 60_001));
+        expect(mod.markSubagentRunTerminated({ runId: nextRunId, reason: "killed" })).toBe(1);
+
+        successor = mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId);
+        expect(successor?.taskRunId).toBe(nextRunId);
+        expect(successor?.taskGenerationRecovery).toBeUndefined();
+        expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({
+          runId: nextRunId,
+          status: "cancelled",
+        });
+        expect(createRunningTaskRunMock).toHaveBeenCalledTimes(2);
+      } finally {
+        resetDetachedTaskLifecycleRuntimeForTests();
+        resetTaskRegistryForTests({ persist: false });
+        resetTaskFlowRegistryForTests({ persist: false });
+      }
+    },
+  );
+
+  it("keeps terminal successor ownership through persistent task creation failure and later repair", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      mocks.callGateway.mockImplementation(async (request: { method?: string }) =>
+        request.method === "agent.wait" ? { status: "pending" } : {},
+      );
+      const oldRunId = "run-orphan-task-persistent-old";
+      const nextRunId = "run-orphan-task-persistent-next";
+      const childSessionKey = "agent:main:subagent:orphan-task-persistent";
+      mod.registerSubagentRun({
+        runId: oldRunId,
+        childSessionKey,
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "retain terminal successor ownership until task storage recovers",
+        cleanup: "keep",
+        expectsCompletionMessage: false,
+      });
+      finalizeTaskRunByRunId({
+        runId: oldRunId,
+        runtime: "subagent",
+        sessionKey: childSessionKey,
+        status: "failed",
+        endedAt: Date.now(),
+        error: "gateway closed (1012): service restart",
+      });
+
+      const baseRuntime = getDetachedTaskLifecycleRuntime();
+      const createRunningTaskRunMock = vi
+        .fn(baseRuntime.createRunningTaskRun)
+        .mockReturnValue(null);
+      if (!baseRuntime.finalizeTaskRunByRunId) {
+        throw new Error("default detached task runtime must support unified finalization");
+      }
+      const finalizeTaskRunByRunIdMock = vi.fn(baseRuntime.finalizeTaskRunByRunId);
+      setDetachedTaskLifecycleRuntime({
+        ...baseRuntime,
+        createRunningTaskRun: createRunningTaskRunMock,
+        finalizeTaskRunByRunId: finalizeTaskRunByRunIdMock,
+      });
+
+      expect(
+        mod.replaceSubagentRunAfterSteer({
+          previousRunId: oldRunId,
+          nextRunId,
+          createFreshTaskGeneration: true,
+        }),
+      ).toBe(true);
+      expect(mod.markSubagentRunTerminated({ runId: nextRunId, reason: "operator killed" })).toBe(
+        1,
+      );
+
+      // The immediate terminal lookup is rate-limited after the initial
+      // failure, and its no-op finalization still names only the successor.
+      expect(createRunningTaskRunMock).toHaveBeenCalledTimes(1);
+      expect(finalizeTaskRunByRunIdMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ runId: nextRunId, status: "cancelled" }),
+      );
+      expect(findTaskByRunIdForStatus(oldRunId)).toMatchObject({ status: "failed" });
+      expect(findTaskByRunIdForStatus(nextRunId)).toBeUndefined();
+
+      vi.setSystemTime(new Date(Date.now() + 60_001));
+      expect(mod.markSubagentRunTerminated({ runId: nextRunId, reason: "operator killed" })).toBe(
+        1,
+      );
+      expect(createRunningTaskRunMock).toHaveBeenCalledTimes(2);
+      expect(
+        mod
+          .listSubagentRunsForRequester("agent:main:main")
+          .find((entry) => entry.runId === nextRunId),
+      ).toMatchObject({
+        taskRunId: oldRunId,
+        taskGenerationRecovery: { runId: nextRunId, attemptCount: 2 },
+        endedReason: SUBAGENT_ENDED_REASON_KILLED,
+      });
+      expect(
+        finalizeTaskRunByRunIdMock.mock.calls.every(([params]) => params.runId === nextRunId),
+      ).toBe(true);
+
+      createRunningTaskRunMock.mockImplementation(baseRuntime.createRunningTaskRun);
+      vi.setSystemTime(new Date(Date.now() + 60_001));
+      expect(mod.markSubagentRunTerminated({ runId: nextRunId, reason: "operator killed" })).toBe(
+        1,
+      );
+
+      const repaired = mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === nextRunId);
+      expect(repaired?.taskRunId).toBe(nextRunId);
+      expect(repaired?.taskGenerationRecovery).toBeUndefined();
+      expect(findTaskByRunIdForStatus(oldRunId)).toMatchObject({ status: "failed" });
+      expect(findTaskByRunIdForStatus(nextRunId)).toMatchObject({
+        runId: nextRunId,
+        status: "cancelled",
+      });
+      expect(createRunningTaskRunMock).toHaveBeenCalledTimes(3);
+      expect(
+        finalizeTaskRunByRunIdMock.mock.calls.every(([params]) => params.runId === nextRunId),
+      ).toBe(true);
+    } finally {
+      resetDetachedTaskLifecycleRuntimeForTests();
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+    }
   });
 
   it("rolls back an older kill ownership boundary when registration persistence fails", () => {

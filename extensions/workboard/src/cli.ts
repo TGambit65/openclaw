@@ -221,6 +221,7 @@ export function registerWorkboardCli(params: { program: Command; store: Workboar
     try {
       const result = await callWorkboardGateway("workboard.cards.dispatch", options, {
         boardId: options.board,
+        ownerMode: "canonical_main_no_origin",
       });
       if (options.json) {
         writeJson(result);

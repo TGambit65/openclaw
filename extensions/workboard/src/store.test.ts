@@ -13,6 +13,7 @@ import {
   type PersistedWorkboardCard,
   type PersistedWorkboardNotificationSubscription,
   type WorkboardKeyedStore,
+  type WorkboardPreparedCompletion,
 } from "./store.js";
 
 function createMemoryStore<T = PersistedWorkboardCard>(options?: {
@@ -49,10 +50,27 @@ function statfsFixture(type: number): ReturnType<typeof fs.statfsSync> {
   };
 }
 
+async function commitPreparedCompletion(
+  store: WorkboardStore,
+  prepared: WorkboardPreparedCompletion,
+  acceptedAt = Date.now(),
+) {
+  return await store.commitVerifiedCompletionIntent({
+    ...prepared,
+    kind: "verified_workboard_completion",
+    payloadHash: `test-payload:${prepared.obligationId}`,
+    acceptedAt,
+    status: "delivered",
+    deliveredAt: acceptedAt,
+  });
+}
+
 describe("WorkboardStore", () => {
   it("persists boards, cards, subscriptions, and attachment blobs in sqlite", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-sqlite-"));
     const dbPath = path.join(dir, "workboard.sqlite");
+    const artifactPath = path.join(dir, "completion-proof.txt");
+    fs.writeFileSync(artifactPath, "ok", "utf8");
     if (process.platform !== "win32") {
       fs.chmodSync(dir, 0o755);
     }
@@ -92,7 +110,19 @@ describe("WorkboardStore", () => {
         contentBase64: Buffer.alloc(70 * 1024).toString("base64"),
       });
       await store.update(card.id, {
-        metadata: { lifecycleStatusSourceUpdatedAt: 1234 },
+        metadata: {
+          lifecycleStatusSourceUpdatedAt: 1234,
+          artifacts: [
+            {
+              id: "artifact-1",
+              createdAt: 1200,
+              path: artifactPath,
+              byteSize: 2,
+              sha256: "a".repeat(64),
+              verifiedAt: 1230,
+            },
+          ],
+        },
       });
       const attachmentId = attached.metadata?.attachments?.[0]?.id;
       const subscription = await store.subscribeNotifications({
@@ -137,6 +167,14 @@ describe("WorkboardStore", () => {
           automation: { boardId: "planning" },
           lifecycleStatusSourceUpdatedAt: 1234,
           comments: [expect.objectContaining({ body: "round trip" })],
+          artifacts: [
+            expect.objectContaining({
+              path: artifactPath,
+              byteSize: 2,
+              sha256: "a".repeat(64),
+              verifiedAt: 1230,
+            }),
+          ],
           attachments: expect.arrayContaining([
             expect.objectContaining({ fileName: "proof.txt" }),
             expect.objectContaining({ fileName: "large-proof.bin" }),
@@ -1409,6 +1447,109 @@ describe("WorkboardStore", () => {
     await expect(store.linkCards(second.id, first.id)).rejects.toThrow(/cycle/);
   });
 
+  it("publishes sqlite dependency links bidirectionally or not at all", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-link-batch-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const firstStores = createWorkboardSqliteStores({ dbPath });
+    const secondStores = createWorkboardSqliteStores({ dbPath });
+    try {
+      const first = new WorkboardStore(firstStores.cards);
+      const second = new WorkboardStore(secondStores.cards);
+      const parent = await first.create({ title: "Atomic parent" });
+      const child = await first.create({ title: "Atomic child" });
+      const originalBatch = firstStores.cards.compareAndSwapBatch?.bind(firstStores.cards);
+      expect(originalBatch).toBeTypeOf("function");
+      if (!originalBatch) {
+        throw new Error("sqlite card batch compare-and-swap is unavailable");
+      }
+      let batchReached!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        batchReached = resolve;
+      });
+      let releaseBatch!: () => void;
+      const release = new Promise<void>((resolve) => {
+        releaseBatch = resolve;
+      });
+      firstStores.cards.compareAndSwapBatch = async (mutation) => {
+        batchReached();
+        await release;
+        return await originalBatch(mutation);
+      };
+
+      const linking = first.linkCards(parent.id, child.id);
+      await reached;
+      await second.addComment(child.id, { body: "Concurrent child edit survives." });
+      releaseBatch();
+
+      await expect(linking).rejects.toThrow(/graph changed concurrently/);
+      const finalParent = await first.get(parent.id);
+      const finalChild = await first.get(child.id);
+      expect(finalParent?.metadata?.links ?? []).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "child", targetCardId: child.id }),
+        ]),
+      );
+      expect(finalChild?.metadata?.links ?? []).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "parent", targetCardId: parent.id }),
+        ]),
+      );
+      expect(finalChild?.metadata?.comments).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ body: "Concurrent child edit survives." }),
+        ]),
+      );
+    } finally {
+      firstStores.close();
+      secondStores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not publish partial sqlite decomposition when a later child fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-decompose-batch-"));
+    const stores = createWorkboardSqliteStores({ dbPath: path.join(dir, "workboard.sqlite") });
+    try {
+      const store = new WorkboardStore(stores.cards);
+      const parent = await store.create({
+        title: "Atomic decomposition parent",
+        idempotencyKey: "atomic-decomposition:1",
+      });
+      const reused = await store.create({
+        title: "Existing reusable child",
+        idempotencyKey: "atomic-decomposition:1:child:1",
+      });
+      await store.addComment(reused.id, { body: "Preexisting child field." });
+
+      await expect(
+        store.decompose(parent.id, {
+          completeParent: false,
+          children: [{ title: "Reuses the existing child" }, { title: "x".repeat(181) }],
+        }),
+      ).rejects.toThrow(/180 characters or fewer/);
+
+      const finalParent = await store.get(parent.id);
+      const finalChild = await store.get(reused.id);
+      expect(finalParent?.metadata?.links ?? []).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "child", targetCardId: reused.id }),
+        ]),
+      );
+      expect(finalChild?.metadata?.links ?? []).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "parent", targetCardId: parent.id }),
+        ]),
+      );
+      expect(finalChild?.metadata?.comments).toEqual(
+        expect.arrayContaining([expect.objectContaining({ body: "Preexisting child field." })]),
+      );
+      expect(await store.list()).toHaveLength(2);
+    } finally {
+      stores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("completes and blocks claimed cards with structured handoff metadata", async () => {
     const store = new WorkboardStore(createMemoryStore());
     const card = await store.create({
@@ -1498,6 +1639,259 @@ describe("WorkboardStore", () => {
       { summary: "Recovered." },
     );
     expect(recovered.metadata?.failureCount).toBeUndefined();
+  });
+
+  it("requires passed proof and an artifact before completing automated cards", async () => {
+    const artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-artifacts-"));
+    const store = new WorkboardStore(createMemoryStore(), {
+      artifactRoot: path.join(artifactDir, "durable"),
+    });
+    const verifiedArtifactPath = path.join(artifactDir, "verified.txt");
+    const persistedArtifactPath = path.join(artifactDir, "persisted.txt");
+    const missingArtifactPath = path.join(artifactDir, "missing.txt");
+    fs.writeFileSync(verifiedArtifactPath, "verified artifact\n", "utf8");
+    fs.writeFileSync(persistedArtifactPath, "persisted artifact\n", "utf8");
+    let sequence = 0;
+    const createAutomated = async (title: string) => {
+      sequence += 1;
+      const sessionKey = `agent:main:subagent:completion-proof-${sequence}`;
+      const runId = `run-completion-proof-${sequence}`;
+      const card = await store.create({
+        title,
+        status: "running",
+        idempotencyKey: `completion-proof:${sequence}`,
+        workspace: { kind: "dir", path: artifactDir },
+        sessionKey,
+        runId,
+        execution: {
+          id: `exec-completion-proof-${sequence}`,
+          kind: "agent-session",
+          engine: "codex",
+          mode: "autonomous",
+          status: "running",
+          model: "default",
+          sessionKey,
+          runId,
+          startedAt: 1,
+          updatedAt: 1,
+        },
+        metadata: {
+          automation: {
+            summary: `Completed ${title}.`,
+            flowId: `flow-completion-proof-${sequence}`,
+            flowOwnerSessionKey: "agent:main:main",
+            flowRevision: 1,
+            controllerId: "workboard",
+          },
+        },
+      });
+      return (await store.claim(card.id, { ownerId: "worker", token: `token-${sequence}` })).card;
+    };
+
+    const missing = await createAutomated("Missing completion evidence");
+    await expect(
+      store.prepareVerifiedCompletionIntent(missing.id, {
+        ownerId: "worker",
+        token: "token-1",
+      }),
+    ).rejects.toThrow(/passed proof and an artifact/);
+    await expect(store.get(missing.id)).resolves.toMatchObject({
+      status: "running",
+      metadata: { claim: { token: "token-1" } },
+    });
+    expect((await store.get(missing.id))?.metadata?.notifications).toBeUndefined();
+
+    const artifactOnly = await createAutomated("Artifact without verification");
+    await expect(
+      store.prepareVerifiedCompletionIntent(artifactOnly.id, {
+        ownerId: "worker",
+        token: "token-2",
+        artifacts: [{ path: "/tmp/unverified.txt" }],
+      }),
+    ).rejects.toThrow(/passed proof and an artifact/);
+    expect((await store.get(artifactOnly.id))?.status).toBe("running");
+    expect((await store.get(artifactOnly.id))?.metadata?.notifications).toBeUndefined();
+
+    for (const status of ["unknown", "failed", "skipped"] as const) {
+      const unverified = await createAutomated(`${status} verification`);
+      await expect(
+        store.prepareVerifiedCompletionIntent(unverified.id, {
+          ownerId: "worker",
+          token: `token-${sequence}`,
+          proof: { status, command: "pnpm test" },
+          artifacts: [{ path: `/tmp/${status}.txt` }],
+        }),
+      ).rejects.toThrow(/passed proof and an artifact/);
+      expect((await store.get(unverified.id))?.status).toBe("running");
+      expect((await store.get(unverified.id))?.metadata?.notifications).toBeUndefined();
+    }
+
+    const nonexistent = await createAutomated("Passed proof with nonexistent artifact");
+    await expect(
+      store.prepareVerifiedCompletionIntent(nonexistent.id, {
+        ownerId: "worker",
+        token: `token-${sequence}`,
+        proof: { status: "passed", command: "pnpm test" },
+        artifacts: [{ path: missingArtifactPath }],
+      }),
+    ).rejects.toThrow(/artifact path could not be verified/);
+    await expect(store.get(nonexistent.id)).resolves.toMatchObject({
+      status: "running",
+      metadata: { claim: { token: `token-${sequence}` } },
+    });
+
+    const remoteOnly = await createAutomated("Passed proof with unverified remote artifact");
+    await expect(
+      store.prepareVerifiedCompletionIntent(remoteOnly.id, {
+        ownerId: "worker",
+        token: `token-${sequence}`,
+        proof: { status: "passed", command: "pnpm test" },
+        artifacts: [{ url: "https://example.invalid/unverified-proof" }],
+      }),
+    ).rejects.toThrow(/verified local artifact/);
+    expect((await store.get(remoteOnly.id))?.status).toBe("running");
+
+    const verified = await createAutomated("Verified completion");
+    await expect(
+      store.prepareVerifiedCompletionIntent(verified.id, {
+        ownerId: "worker",
+        token: `token-${sequence}`,
+        proof: { status: "passed", command: "pnpm test" },
+        artifacts: [{ path: verifiedArtifactPath }],
+      }),
+    ).resolves.toMatchObject({
+      cardId: verified.id,
+      sessionKey: `agent:main:subagent:completion-proof-${sequence}`,
+      runId: `run-completion-proof-${sequence}`,
+      proof: expect.objectContaining({ status: "passed" }),
+      artifacts: [
+        expect.objectContaining({
+          byteSize: Buffer.byteLength("verified artifact\n"),
+          sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+          verifiedAt: expect.any(Number),
+        }),
+      ],
+    });
+    sequence += 1;
+    const persistedBase = await store.create({
+      title: "Persisted completion evidence",
+      status: "running",
+      idempotencyKey: `completion-proof:${sequence}`,
+      workspace: { kind: "dir", path: artifactDir },
+      sessionKey: `agent:main:subagent:completion-proof-${sequence}`,
+      runId: `run-completion-proof-${sequence}`,
+      execution: {
+        id: `exec-completion-proof-${sequence}`,
+        kind: "agent-session",
+        engine: "codex",
+        mode: "autonomous",
+        status: "running",
+        model: "default",
+        sessionKey: `agent:main:subagent:completion-proof-${sequence}`,
+        runId: `run-completion-proof-${sequence}`,
+        startedAt: 1,
+        updatedAt: 1,
+      },
+      metadata: {
+        automation: {
+          flowId: `flow-completion-proof-${sequence}`,
+          flowOwnerSessionKey: "agent:main:main",
+          flowRevision: 1,
+          controllerId: "workboard",
+        },
+      },
+    });
+    await store.addProof(persistedBase.id, { status: "passed", command: "pnpm test" });
+    await store.addArtifact(persistedBase.id, { path: persistedArtifactPath });
+    const persisted = (
+      await store.claim(persistedBase.id, { ownerId: "worker", token: `token-${sequence}` })
+    ).card;
+    await expect(
+      store.prepareVerifiedCompletionIntent(persisted.id, {
+        ownerId: "worker",
+        token: `token-${sequence}`,
+        summary: "Prepared persisted evidence.",
+      }),
+    ).resolves.toMatchObject({ cardId: persisted.id });
+
+    const manual = await store.create({ title: "Manual completion", status: "running" });
+    await expect(store.complete(manual.id, {}, null)).resolves.toMatchObject({ status: "done" });
+
+    const idempotentManual = await store.create({
+      title: "Idempotent manual completion",
+      status: "running",
+      idempotencyKey: "manual-api-dedupe:1",
+    });
+    await expect(store.complete(idempotentManual.id, {}, null)).resolves.toMatchObject({
+      status: "done",
+    });
+    fs.rmSync(artifactDir, { recursive: true, force: true });
+  });
+
+  it("rejects verified completion artifacts outside the dispatched workspace", async () => {
+    const artifactDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "openclaw-workboard-artifact-containment-"),
+    );
+    const workspaceDir = path.join(artifactDir, "workspace");
+    fs.mkdirSync(workspaceDir);
+    const insideArtifactPath = path.join(workspaceDir, "inside.txt");
+    const outsideArtifactPath = path.join(artifactDir, "outside.txt");
+    const escapedSymlinkPath = path.join(workspaceDir, "escaped.txt");
+    fs.writeFileSync(insideArtifactPath, "inside workspace\n", "utf8");
+    fs.writeFileSync(outsideArtifactPath, "outside workspace\n", "utf8");
+    fs.symlinkSync(outsideArtifactPath, escapedSymlinkPath);
+    const store = new WorkboardStore(createMemoryStore(), {
+      artifactRoot: path.join(artifactDir, "durable"),
+    });
+    const card = await store.create({
+      title: "Contained completion evidence",
+      status: "running",
+      idempotencyKey: "completion-artifact-containment:1",
+      workspace: { kind: "dir", path: workspaceDir },
+      sessionKey: "agent:main:subagent:artifact-containment",
+      runId: "run-artifact-containment",
+      execution: {
+        id: "exec-artifact-containment",
+        kind: "agent-session",
+        engine: "codex",
+        mode: "autonomous",
+        status: "running",
+        model: "default",
+        sessionKey: "agent:main:subagent:artifact-containment",
+        runId: "run-artifact-containment",
+        startedAt: 1,
+        updatedAt: 1,
+      },
+      metadata: {
+        automation: {
+          flowId: "flow-artifact-containment",
+          flowOwnerSessionKey: "agent:main:main",
+          flowRevision: 1,
+          controllerId: "workboard",
+        },
+      },
+    });
+    await store.claim(card.id, { ownerId: "worker", token: "artifact-containment-token" });
+    const completeWithArtifact = (artifactPath: string) =>
+      store.prepareVerifiedCompletionIntent(card.id, {
+        ownerId: "worker",
+        token: "artifact-containment-token",
+        summary: "Verified only workspace-owned output.",
+        proof: { status: "passed", command: "pnpm test" },
+        artifacts: [{ path: artifactPath }],
+      });
+
+    await expect(completeWithArtifact(outsideArtifactPath)).rejects.toThrow(
+      /artifact path must be inside the dispatched workspace/,
+    );
+    await expect(completeWithArtifact(escapedSymlinkPath)).rejects.toThrow(
+      /artifact path must be inside the dispatched workspace/,
+    );
+    await expect(completeWithArtifact(insideArtifactPath)).resolves.toMatchObject({
+      artifacts: [expect.objectContaining({ path: expect.stringContaining("/durable/") })],
+    });
+
+    fs.rmSync(artifactDir, { recursive: true, force: true });
   });
 
   it("keeps long lifecycle handoffs in comments while capping notifications", async () => {
@@ -2074,6 +2468,524 @@ describe("WorkboardStore", () => {
     expect(stopped.execution).toBeUndefined();
     expect(stopped.metadata?.attempts).toEqual([expect.objectContaining({ status: "stopped" })]);
     expect(stopped.metadata?.failureCount).toBeUndefined();
+  });
+
+  it("does not recover an interrupted card after its revision has completed", async () => {
+    const artifactDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-cas-finish-"));
+    const store = new WorkboardStore(createMemoryStore(), {
+      artifactRoot: path.join(artifactDir, "durable"),
+    });
+    const created = await store.create({
+      title: "CAS recovery",
+      status: "running",
+      idempotencyKey: "cas-recovery:1",
+      workspace: { kind: "dir", path: artifactDir },
+      maxRetries: 2,
+      sessionKey: "agent:main:subagent:cas-recovery",
+      runId: "run-before-restart",
+      execution: {
+        id: "exec-cas-recovery",
+        kind: "agent-session",
+        engine: "codex",
+        mode: "autonomous",
+        status: "running",
+        model: "default",
+        sessionKey: "agent:main:subagent:cas-recovery",
+        runId: "run-before-restart",
+        startedAt: 10,
+        updatedAt: 10,
+      },
+      metadata: {
+        automation: {
+          flowId: "flow-cas-recovery",
+          flowOwnerSessionKey: "agent:main:main",
+          flowRevision: 1,
+          controllerId: "workboard",
+        },
+      },
+    });
+    const running = (
+      await store.claim(created.id, { ownerId: "worker", token: "cas-finish-token" })
+    ).card;
+    const expectedRevision = running.events?.at(-1)?.id ?? "";
+    expect(expectedRevision).toBeTruthy();
+    const artifactPath = path.join(artifactDir, "finished.txt");
+    fs.writeFileSync(artifactPath, "finished before recovery\n", "utf8");
+    const prepared = await store.prepareVerifiedCompletionIntent(running.id, {
+      ownerId: "worker",
+      token: "cas-finish-token",
+      summary: "Finished before recovery won the race.",
+      proof: { status: "passed", command: "test completion won" },
+      artifacts: [{ path: artifactPath }],
+    });
+    expect(prepared).toBeDefined();
+    await commitPreparedCompletion(store, prepared!);
+
+    const recovered = await store.recoverInterrupted(running.id, {
+      expectedRunId: "run-before-restart",
+      expectedRevision,
+      reason: "Gateway restart",
+    });
+
+    expect(recovered).toBeUndefined();
+    await expect(store.get(running.id)).resolves.toMatchObject({ status: "done" });
+    fs.rmSync(artifactDir, { recursive: true, force: true });
+  });
+
+  it("atomically reclaims an eligible interrupted card and consumes one retry", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const running = await store.create({
+      title: "Atomic recovery",
+      status: "running",
+      idempotencyKey: "atomic-recovery:1",
+      maxRetries: 2,
+      sessionKey: "agent:main:subagent:atomic-recovery",
+      runId: "run-before-restart",
+      execution: {
+        id: "exec-atomic-recovery",
+        kind: "agent-session",
+        engine: "codex",
+        mode: "autonomous",
+        status: "running",
+        model: "default",
+        sessionKey: "agent:main:subagent:atomic-recovery",
+        runId: "run-before-restart",
+        startedAt: 10,
+        updatedAt: 10,
+      },
+    });
+
+    const recovered = await store.recoverInterrupted(running.id, {
+      expectedRunId: "run-before-restart",
+      expectedRevision: running.events?.at(-1)?.id ?? "",
+      reason: "Gateway restart",
+    });
+
+    expect(recovered).toMatchObject({
+      status: "ready",
+      metadata: {
+        failureCount: 1,
+        attempts: [expect.objectContaining({ status: "stopped", error: "Gateway restart" })],
+      },
+    });
+    expect(recovered?.execution).toMatchObject({
+      status: "idle",
+      runId: "run-before-restart",
+    });
+    expect(recovered?.metadata?.automation?.recoveryRunId).toBe("run-before-restart");
+    expect(recovered?.metadata?.claim).toBeUndefined();
+  });
+
+  it("does not overwrite a completion committed by another sqlite store instance", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-cas-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const firstStores = createWorkboardSqliteStores({ dbPath });
+    const secondStores = createWorkboardSqliteStores({ dbPath });
+    try {
+      const artifactRoot = path.join(dir, "artifacts");
+      const first = new WorkboardStore(firstStores.cards, { artifactRoot });
+      const second = new WorkboardStore(secondStores.cards, { artifactRoot });
+      const created = await first.create({
+        title: "Cross-store completion",
+        status: "running",
+        idempotencyKey: "cross-store-completion:1",
+        workspace: { kind: "dir", path: dir },
+        maxRetries: 2,
+        sessionKey: "agent:main:subagent:cross-store-completion",
+        runId: "run-cross-store-completion",
+        execution: {
+          id: "exec-cross-store-completion",
+          kind: "agent-session",
+          engine: "codex",
+          mode: "autonomous",
+          status: "running",
+          model: "default",
+          sessionKey: "agent:main:subagent:cross-store-completion",
+          runId: "run-cross-store-completion",
+          startedAt: 10,
+          updatedAt: 10,
+        },
+        metadata: {
+          automation: {
+            flowId: "flow-cross-store-completion",
+            flowOwnerSessionKey: "agent:main:main",
+            flowRevision: 1,
+            controllerId: "workboard",
+          },
+        },
+      });
+      const running = (
+        await first.claim(created.id, { ownerId: "worker", token: "cross-store-token" })
+      ).card;
+      const crossStoreArtifactPath = path.join(dir, "cross-store-proof.txt");
+      fs.writeFileSync(crossStoreArtifactPath, "cross-store proof\n", "utf8");
+      const originalCompareAndSwap = firstStores.cards.compareAndSwap?.bind(firstStores.cards);
+      expect(originalCompareAndSwap).toBeTypeOf("function");
+      if (!originalCompareAndSwap) {
+        throw new Error("sqlite card compare-and-swap is unavailable");
+      }
+      let reachedCompareAndSwap!: () => void;
+      const compareAndSwapReached = new Promise<void>((resolve) => {
+        reachedCompareAndSwap = resolve;
+      });
+      let releaseCompareAndSwap!: () => void;
+      const compareAndSwapRelease = new Promise<void>((resolve) => {
+        releaseCompareAndSwap = resolve;
+      });
+      firstStores.cards.compareAndSwap = async (key, value, options) => {
+        reachedCompareAndSwap();
+        await compareAndSwapRelease;
+        return await originalCompareAndSwap(key, value, options);
+      };
+
+      const recovering = first.recoverInterrupted(running.id, {
+        expectedRunId: "run-cross-store-completion",
+        expectedRevision: running.events?.at(-1)?.id ?? "",
+        reason: "Gateway restart",
+      });
+      await compareAndSwapReached;
+      const prepared = await second.prepareVerifiedCompletionIntent(running.id, {
+        ownerId: "worker",
+        token: "cross-store-token",
+        summary: "Completed through the other sqlite connection.",
+        proof: { status: "passed", command: "pnpm test" },
+        artifacts: [{ path: crossStoreArtifactPath }],
+      });
+      expect(prepared).toBeDefined();
+      await commitPreparedCompletion(second, prepared!);
+      releaseCompareAndSwap();
+
+      await expect(recovering).resolves.toBeUndefined();
+      await expect(first.get(running.id)).resolves.toMatchObject({ status: "done" });
+    } finally {
+      firstStores.close();
+      secondStores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a stale ordinary sqlite writer after guarded terminal settlement", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-stale-writer-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const terminalStores = createWorkboardSqliteStores({ dbPath });
+    const staleStores = createWorkboardSqliteStores({ dbPath });
+    try {
+      const terminal = new WorkboardStore(terminalStores.cards);
+      const stale = new WorkboardStore(staleStores.cards);
+      const running = await terminal.create({
+        title: "Terminal state wins",
+        status: "running",
+        sessionKey: "agent:main:subagent:terminal-wins",
+        runId: "run-terminal-wins",
+        execution: {
+          id: "exec-terminal-wins",
+          kind: "agent-session",
+          engine: "codex",
+          mode: "autonomous",
+          status: "running",
+          model: "default",
+          sessionKey: "agent:main:subagent:terminal-wins",
+          runId: "run-terminal-wins",
+          startedAt: 10,
+          updatedAt: 10,
+        },
+      });
+      const originalCompareAndSwap = staleStores.cards.compareAndSwap?.bind(staleStores.cards);
+      expect(originalCompareAndSwap).toBeTypeOf("function");
+      if (!originalCompareAndSwap) {
+        throw new Error("sqlite card compare-and-swap is unavailable");
+      }
+      let staleReached!: () => void;
+      const staleWriterReached = new Promise<void>((resolve) => {
+        staleReached = resolve;
+      });
+      let releaseStale!: () => void;
+      const staleWriterRelease = new Promise<void>((resolve) => {
+        releaseStale = resolve;
+      });
+      staleStores.cards.compareAndSwap = async (key, value, options) => {
+        staleReached();
+        await staleWriterRelease;
+        return await originalCompareAndSwap(key, value, options);
+      };
+
+      const staleWrite = stale.update(running.id, {
+        metadata: {
+          ...running.metadata,
+          workerLogs: [
+            {
+              id: "stale-log",
+              level: "info",
+              message: "Heartbeat computed before settlement.",
+              createdAt: 11,
+            },
+          ],
+        },
+      });
+      await staleWriterReached;
+      const settled = await terminal.settleTerminatedWorker(running.id, {
+        expectedRevision: running.events?.at(-1)?.id ?? "",
+        targetSessionKey: "agent:main:subagent:terminal-wins",
+        runId: "run-terminal-wins",
+        detail: "Worker exited before completion.",
+      });
+      expect(settled).toMatchObject({ status: "blocked", execution: { status: "blocked" } });
+      releaseStale();
+
+      await expect(staleWrite).rejects.toThrow(/changed concurrently/);
+      await expect(terminal.get(running.id)).resolves.toMatchObject({
+        status: "blocked",
+        execution: { status: "blocked" },
+      });
+    } finally {
+      terminalStores.close();
+      staleStores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stale claimed completion after another sqlite connection settles the worker", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-stale-complete-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const terminalStores = createWorkboardSqliteStores({ dbPath });
+    const workerStores = createWorkboardSqliteStores({ dbPath });
+    try {
+      const terminal = new WorkboardStore(terminalStores.cards);
+      const worker = new WorkboardStore(workerStores.cards);
+      const created = await terminal.create({
+        title: "Late worker completion",
+        status: "running",
+        sessionKey: "agent:main:subagent:late-complete",
+        runId: "run-late-complete",
+        execution: {
+          id: "exec-late-complete",
+          kind: "agent-session",
+          engine: "codex",
+          mode: "autonomous",
+          status: "running",
+          model: "default",
+          sessionKey: "agent:main:subagent:late-complete",
+          runId: "run-late-complete",
+          startedAt: 10,
+          updatedAt: 10,
+        },
+      });
+      const claimed = await terminal.claim(created.id, { ownerId: "worker", token: "late-token" });
+      const originalLookup = workerStores.cards.lookup.bind(workerStores.cards);
+      let lookupCount = 0;
+      let workerReached!: () => void;
+      const workerAtPersist = new Promise<void>((resolve) => {
+        workerReached = resolve;
+      });
+      let releaseWorker!: () => void;
+      const workerRelease = new Promise<void>((resolve) => {
+        releaseWorker = resolve;
+      });
+      workerStores.cards.lookup = async (key) => {
+        lookupCount += 1;
+        if (key === created.id && lookupCount === 2) {
+          workerReached();
+          await workerRelease;
+        }
+        return await originalLookup(key);
+      };
+
+      const completing = worker.complete(created.id, {
+        ownerId: "worker",
+        token: "late-token",
+        summary: "Computed before terminal settlement.",
+      });
+      await workerAtPersist;
+      const settled = await terminal.settleTerminatedWorker(created.id, {
+        expectedRevision: claimed.card.events?.at(-1)?.id ?? "",
+        targetSessionKey: "agent:main:subagent:late-complete",
+        runId: "run-late-complete",
+        detail: "Worker exited before completion.",
+      });
+      expect(settled?.status).toBe("blocked");
+      releaseWorker();
+
+      await expect(completing).rejects.toThrow(/card is not claimed/);
+      const final = await terminal.get(created.id);
+      expect(final).toMatchObject({ status: "blocked", execution: { status: "blocked" } });
+      expect(final?.metadata?.notifications?.some((entry) => entry.kind === "completed")).toBe(
+        false,
+      );
+    } finally {
+      terminalStores.close();
+      workerStores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects late worker mutations after terminal settlement clears the claim", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const created = await store.create({
+      title: "Cleared worker claim",
+      status: "running",
+      sessionKey: "agent:main:subagent:cleared-claim",
+      runId: "run-cleared-claim",
+      execution: {
+        id: "exec-cleared-claim",
+        kind: "agent-session",
+        engine: "codex",
+        mode: "autonomous",
+        status: "running",
+        model: "default",
+        sessionKey: "agent:main:subagent:cleared-claim",
+        runId: "run-cleared-claim",
+        startedAt: 10,
+        updatedAt: 10,
+      },
+    });
+    const claimed = await store.claim(created.id, { ownerId: "worker", token: "cleared-token" });
+    await store.settleTerminatedWorker(created.id, {
+      expectedRevision: claimed.card.events?.at(-1)?.id ?? "",
+      targetSessionKey: "agent:main:subagent:cleared-claim",
+      runId: "run-cleared-claim",
+      detail: "Worker exited before completion.",
+    });
+
+    await expect(
+      store.complete(created.id, {
+        ownerId: "worker",
+        token: "cleared-token",
+        summary: "Too late.",
+      }),
+    ).rejects.toThrow(/not claimed/);
+    await expect(
+      store.complete(created.id, { ownerId: "worker", summary: "Still too late." }),
+    ).rejects.toThrow(/not claimed/);
+    await expect(store.heartbeat(created.id, { token: "cleared-token" })).rejects.toThrow(
+      /not claimed/,
+    );
+    expect((await store.get(created.id))?.status).toBe("blocked");
+  });
+
+  it("serializes dispatch claims so one owner cannot start two cards concurrently", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const first = await store.create({
+      title: "Owner work A",
+      status: "ready",
+      agentId: "agent-a",
+    });
+    const second = await store.create({
+      title: "Owner work B",
+      status: "ready",
+      agentId: "agent-a",
+    });
+
+    const claims = await Promise.allSettled([
+      store.claimForDispatch(first.id, { ownerId: "agent-a" }),
+      store.claimForDispatch(second.id, { ownerId: "agent-a" }),
+    ]);
+
+    expect(claims.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(claims.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(claims.find((result) => result.status === "rejected")).toMatchObject({
+      reason: expect.objectContaining({ message: expect.stringContaining("active card") }),
+    });
+  });
+
+  it("commits the claim, workflow defaults, and pending start identity in one dispatch CAS", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const card = await store.create({ title: "Crash after dispatch claim", status: "ready" });
+
+    const claimed = await store.claimForDispatch(
+      card.id,
+      { ownerId: "dispatch-owner", token: "dispatch-token" },
+      {
+        startIdempotencyKey: "start-generation-1",
+        startSessionKey: "agent:main:subagent:workboard-crash",
+        startModel: "openai/test-model",
+        startProvider: "openai",
+        workflowIdempotencyKey: "workflow-crash-safe",
+        maxRetries: 2,
+      },
+    );
+
+    expect(claimed.card).toMatchObject({
+      status: "running",
+      metadata: {
+        claim: { ownerId: "dispatch-owner", token: "dispatch-token" },
+        automation: {
+          idempotencyKey: "workflow-crash-safe",
+          maxRetries: 2,
+          startIdempotencyKey: "start-generation-1",
+          startSessionKey: "agent:main:subagent:workboard-crash",
+          startModel: "openai/test-model",
+          startProvider: "openai",
+        },
+      },
+    });
+    await expect(store.get(card.id)).resolves.toEqual(claimed.card);
+  });
+
+  it("uses the actual claim owner for unassigned-card dispatch concurrency", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const first = await store.create({ title: "Shared owner A", status: "ready" });
+    const second = await store.create({ title: "Shared owner B", status: "ready" });
+
+    const claims = await Promise.allSettled([
+      store.claimForDispatch(first.id, { ownerId: "shared-owner" }),
+      store.claimForDispatch(second.id, { ownerId: "shared-owner" }),
+    ]);
+
+    expect(claims.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(claims.filter((result) => result.status === "rejected")).toHaveLength(1);
+  });
+
+  it("prevents two sqlite store instances from claiming one owner slot", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-owner-cas-"));
+    const dbPath = path.join(dir, "workboard.sqlite");
+    const firstStores = createWorkboardSqliteStores({ dbPath });
+    const secondStores = createWorkboardSqliteStores({ dbPath });
+    try {
+      const first = new WorkboardStore(firstStores.cards);
+      const second = new WorkboardStore(secondStores.cards);
+      const firstCard = await first.create({ title: "SQLite owner A", status: "ready" });
+      const secondCard = await first.create({ title: "SQLite owner B", status: "ready" });
+      let arrivals = 0;
+      let releaseBoth!: () => void;
+      const bothReleased = new Promise<void>((resolve) => {
+        releaseBoth = resolve;
+      });
+      let bothArrived!: () => void;
+      const arrivalsComplete = new Promise<void>((resolve) => {
+        bothArrived = resolve;
+      });
+      for (const cards of [firstStores.cards, secondStores.cards]) {
+        const originalCompareAndSwap = cards.compareAndSwap?.bind(cards);
+        expect(originalCompareAndSwap).toBeTypeOf("function");
+        if (!originalCompareAndSwap) {
+          throw new Error("sqlite card compare-and-swap is unavailable");
+        }
+        cards.compareAndSwap = async (key, value, options) => {
+          arrivals += 1;
+          if (arrivals === 2) {
+            bothArrived();
+          }
+          await bothReleased;
+          return await originalCompareAndSwap(key, value, options);
+        };
+      }
+
+      const claimsPromise = Promise.allSettled([
+        first.claimForDispatch(firstCard.id, { ownerId: "shared-sqlite-owner" }),
+        second.claimForDispatch(secondCard.id, { ownerId: "shared-sqlite-owner" }),
+      ]);
+      await arrivalsComplete;
+      releaseBoth();
+      const claims = await claimsPromise;
+
+      expect(claims.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(claims.filter((result) => result.status === "rejected")).toHaveLength(1);
+      expect((await first.list()).filter((card) => card.status === "running")).toHaveLength(1);
+    } finally {
+      firstStores.close();
+      secondStores.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("includes parent results and recent assignee work in worker context", async () => {

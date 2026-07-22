@@ -70,6 +70,7 @@ export const WORKBOARD_DIAGNOSTIC_KINDS = [
   "repeated_failures",
   "missing_proof",
   "orphaned_session",
+  "completion_delivery_failed",
 ] as const;
 export const WORKBOARD_DIAGNOSTIC_SEVERITIES = ["warning", "error", "critical"] as const;
 export const WORKBOARD_NOTIFICATION_KINDS = ["completed", "failed", "stale"] as const;
@@ -157,6 +158,77 @@ export type WorkboardArtifact = {
   url?: string;
   path?: string;
   mimeType?: string;
+  /** Size of the exact local file read by the Workboard verifier. */
+  byteSize?: number;
+  /** SHA-256 of the exact local file read by the Workboard verifier. */
+  sha256?: string;
+  /** Time at which Workboard successfully read and hashed the local file. */
+  verifiedAt?: number;
+};
+
+export type WorkboardCompletionDeliveryStatus =
+  | "pending"
+  | "in_progress"
+  | "delivered"
+  | "failed"
+  | "suspended"
+  | "discarded";
+
+/** Immutable verified evidence accepted by the native completion-delivery runtime. */
+export type WorkboardCompletionArtifactIdentity = {
+  id: string;
+  createdAt: number;
+  path: string;
+  byteSize: number;
+  sha256: string;
+  verifiedAt: number;
+  label?: string;
+  url?: string;
+  mimeType?: string;
+};
+
+export type WorkboardCompletionProofIdentity = WorkboardProof & {
+  status: "passed";
+};
+
+export type WorkboardRequesterOrigin = {
+  channel?: string;
+  to?: string;
+  accountId?: string;
+  threadId?: string | number;
+};
+
+/** Workboard's read projection of the core-owned verified completion intent. */
+export type WorkboardCompletionDelivery = {
+  kind: "verified_workboard_completion";
+  obligationId: string;
+  cardId: string;
+  sessionKey: string;
+  runId: string;
+  payloadHash: string;
+  acceptedAt: number;
+  status: WorkboardCompletionDeliveryStatus;
+  deliveredAt?: number;
+  lastError?: string;
+  discardReason?: string;
+  cleanupCompletedAt?: number;
+};
+
+export type WorkboardManagedFlowView = {
+  flowId: string;
+  revision: number;
+  status:
+    | "queued"
+    | "running"
+    | "waiting"
+    | "blocked"
+    | "succeeded"
+    | "failed"
+    | "cancelled"
+    | "lost";
+  currentStep?: string;
+  wait?: unknown;
+  taskSummary?: unknown;
 };
 
 export type WorkboardAttachment = {
@@ -246,6 +318,23 @@ export type WorkboardAutomation = {
   createdCardIds?: string[];
   dispatchCount?: number;
   lastDispatchAt?: number;
+  recoveryRunId?: string;
+  recoveryStartFailures?: number;
+  startIdempotencyKey?: string;
+  startSessionKey?: string;
+  startModel?: string;
+  startProvider?: string;
+  /** Exact initiating conversation that must receive the final acknowledgement. */
+  requesterSessionKey?: string;
+  /** Trusted policy for route-less scheduled work; never accepted from public RPC input. */
+  requesterOwnerMode?: "canonical_main_no_origin";
+  requesterOrigin?: WorkboardRequesterOrigin;
+  requesterWorkspace?: string;
+  flowId?: string;
+  flowOwnerSessionKey?: string;
+  flowRevision?: number;
+  controllerId?: "workboard";
+  completionDelivery?: WorkboardCompletionDelivery;
 };
 
 export type WorkboardBoardMetadata = {

@@ -140,6 +140,26 @@ describe("registerWorkboardCli", () => {
     expect(output).toContain("archivedAt");
   });
 
+  it("requests fixed canonical ownership for CLI dispatch without escalating scope", async () => {
+    const store = new WorkboardStore(createMemoryStore());
+    const program = createProgram(store);
+    gatewayRuntime.callGatewayFromCli.mockResolvedValueOnce({ started: [], startFailures: [] });
+
+    await captureStdout(async () => {
+      await program.parseAsync(["workboard", "dispatch", "--board", "ops"], { from: "user" });
+    });
+
+    expect(gatewayRuntime.callGatewayFromCli).toHaveBeenCalledWith(
+      "workboard.cards.dispatch",
+      expect.objectContaining({ board: "ops" }),
+      { boardId: "ops", ownerMode: "canonical_main_no_origin" },
+      {
+        mode: "cli",
+        scopes: ["operator.write", "operator.read"],
+      },
+    );
+  });
+
   it("does not fall back to local dispatch for explicit gateway targets", async () => {
     const store = new WorkboardStore(createMemoryStore());
     const card = await store.create({ title: "Remote target", status: "ready" });

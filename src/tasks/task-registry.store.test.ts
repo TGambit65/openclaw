@@ -25,8 +25,10 @@ import {
   createTaskRecord as createTaskRecordOrNull,
   deleteTaskRecordById,
   findTaskByRunId,
+  findTaskByRunIdStrict,
   getTaskById,
   listFreshTasksForOwnerKey,
+  listTasksByRunId,
   markTaskTerminalById,
   maybeDeliverTaskStateChangeUpdate,
   resetTaskRegistryForTests,
@@ -154,6 +156,38 @@ describe("task-registry store runtime", () => {
     expect(latestSnapshot.tasks.get("task-restored")?.task).toBe("Restored task");
   });
 
+  it("lists duplicate run ids newest-first with deterministic timestamp ties", () => {
+    const storedTask = createStoredTask();
+    const createMatch = (taskId: string, createdAt: number): TaskRecord => ({
+      ...storedTask,
+      taskId,
+      createdAt,
+      lastEventAt: createdAt,
+    });
+    const oldest = createMatch("task-oldest", 100);
+    const firstNewest = createMatch("task-first-newest", 200);
+    const secondNewest = createMatch("task-second-newest", 200);
+    configureTaskRegistryRuntime({
+      store: {
+        loadSnapshot: () => ({
+          tasks: new Map([
+            [oldest.taskId, oldest],
+            [firstNewest.taskId, firstNewest],
+            [secondNewest.taskId, secondNewest],
+          ]),
+          deliveryStates: new Map(),
+        }),
+        saveSnapshot: () => {},
+      },
+    });
+
+    expect(listTasksByRunId("run-restored").map((task) => task.taskId)).toEqual([
+      "task-second-newest",
+      "task-first-newest",
+      "task-oldest",
+    ]);
+  });
+
   it("logs restore parser failures and keeps the registry empty", async () => {
     const warnLogs = createWarnLogCapture("openclaw-task-registry-restore-test");
     const invalidValue = "not-requested";
@@ -169,6 +203,12 @@ describe("task-registry store runtime", () => {
         },
       });
 
+      expect(() => findTaskByRunIdStrict("run-restored")).toThrow(
+        `Invalid persisted task delivery status: ${JSON.stringify(invalidValue)}`,
+      );
+      expect(() => listTasksByRunId("run-restored")).toThrow(
+        `Invalid persisted task delivery status: ${JSON.stringify(invalidValue)}`,
+      );
       expect(findTaskByRunId("run-restored")).toBeUndefined();
       expect(await warnLogs.findText(invalidValue)).toContain(invalidValue);
       expect(getTaskById("task-restored")).toBeUndefined();

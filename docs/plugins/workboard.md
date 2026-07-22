@@ -164,11 +164,13 @@ data side of dispatch: stale-claim cleanup, dependency promotion, timeout
 cleanup).
 
 Session keys are deterministic per board/card, so repeated dispatches route
-back to the same worker lane instead of creating unrelated sessions:
+back to the same worker lane instead of creating unrelated sessions. The
+Gateway canonicalizes both forms to agent-scoped worker keys before starting
+or persisting a route-less run:
 
 - Assigned cards: `agent:<agentId>:subagent:workboard-<boardId>-<cardId>`
-- Unassigned cards: `subagent:workboard-<boardId>-<cardId>` (Gateway resolves
-  the configured default agent)
+- Unassigned cards: `agent:<defaultAgentId>:subagent:workboard-<boardId>-<cardId>`
+  (the Gateway resolves the configured default agent)
 
 If a worker cannot be started after a card is claimed, Workboard blocks the
 card, clears the claim, records the run-start failure, and appends a worker
@@ -292,8 +294,11 @@ Gateway RPC methods live under `workboard.*`:
 | `operator.read`  | `cards.list`, `cards.export`, `cards.diagnostics`, attachment list/get, notification event reads, `boards.list`, `cards.stats`, `cards.runs`                                                                                                                                                                                                                                       |
 | `operator.write` | `cards.diagnostics.refresh`, create/update/move/delete/comment/link/linkDependency/proof/artifact, attachment add/delete, worker log, protocol violation, claim/heartbeat/release/promote/reassign/reclaim/complete/block/unblock, `cards.dispatch`, `cards.bulk`, archive, `boards.upsert`/`archive`/`delete`, `cards.specify`/`decompose`, notification subscribe/delete/advance |
 
-No RPC method requires `operator.admin`. Browsers connected with read-only
-operator access can inspect the board but cannot mutate cards.
+The fixed canonical owner mode used by route-less CLI and dashboard dispatch
+requires `operator.write`; those clients also use `operator.read` to reload the
+resulting board state. Dispatching a managed worktree additionally requires
+`operator.admin`. Browsers connected with read-only operator access can inspect
+the board but cannot mutate cards.
 
 ## Storage
 

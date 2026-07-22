@@ -295,6 +295,21 @@ function getCachedAgentRun(runId: string) {
   return agentRunCache.get(runId);
 }
 
+/** Inspect process-local lifecycle ownership before consulting durable fallback state. */
+export function inspectAgentJobState(runId: string): {
+  terminal: AgentWaitTerminalSnapshot | null;
+  unsettled: boolean;
+} {
+  ensureAgentRunListener();
+  return {
+    terminal: getCachedAgentRun(runId) ?? null,
+    unsettled:
+      agentRunStarts.has(runId) ||
+      pendingAgentRunErrors.has(runId) ||
+      pendingAgentRunTimeouts.has(runId),
+  };
+}
+
 function addAgentRunWaiter(runId: string): () => void {
   agentRunWaiterCounts.set(runId, (agentRunWaiterCounts.get(runId) ?? 0) + 1);
   let removed = false;

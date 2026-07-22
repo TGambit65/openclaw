@@ -74,6 +74,8 @@ const tasksWithPendingDelivery = taskRegistryProcessState.tasksWithPendingDelive
 let listenerStarted = false;
 let listenerStop: (() => void) | null = null;
 let restoreAttempted = false;
+let restoreError: unknown;
+let restoreFailed = false;
 const taskFlowSyncRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 type TaskRegistryDeliveryRuntime = Pick<
   typeof import("./task-registry-delivery-runtime.js"),
@@ -1196,6 +1198,8 @@ function restoreTaskRegistryOnce() {
     return;
   }
   restoreAttempted = true;
+  restoreError = undefined;
+  restoreFailed = false;
   try {
     const restored = getTaskRegistryStore().loadSnapshot();
     if (restored.tasks.size === 0 && restored.deliveryStates.size === 0) {
@@ -1216,6 +1220,8 @@ function restoreTaskRegistryOnce() {
       tasks: snapshotTaskRecords(tasks),
     }));
   } catch (error) {
+    restoreError = error;
+    restoreFailed = true;
     log.warn("Failed to restore task registry", { error: formatErrorMessage(error) });
   }
 }
@@ -1228,6 +1234,8 @@ export function ensureTaskRegistryReady() {
 export function reloadTaskRegistryFromStore(): void {
   clearTaskRegistryMemory();
   restoreAttempted = false;
+  restoreError = undefined;
+  restoreFailed = false;
   restoreTaskRegistryOnce();
 }
 
@@ -2139,6 +2147,72 @@ export function finalizeTaskRunByRunId(params: {
   });
 }
 
+/**
+ * Corrects the exact Workboard task projection after core has durably accepted
+ * its verified completion intent. This is intentionally narrower than the
+ * ordinary run finalizer: a stale lifecycle failure may lose only when the
+ * same task/run/session/flow identity proves that completion was accepted
+ * before that terminal projection.
+ */
+export function reconcileTaskWithVerifiedWorkboardCompletion(params: {
+  taskId: string;
+  runId: string;
+  sessionKey: string;
+  flowId: string;
+  acceptedAt: number;
+  endedAt: number;
+  completionText: string;
+}): TaskRecord | null {
+  ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  const completionText = normalizeTaskSummary(params.completionText);
+  if (
+    !current ||
+    current.runtime !== "subagent" ||
+    current.label?.trim() !== "plugin:workboard" ||
+    current.runId?.trim() !== params.runId.trim() ||
+    current.childSessionKey?.trim() !== params.sessionKey.trim() ||
+    current.parentFlowId?.trim() !== params.flowId.trim() ||
+    !params.runId.trim() ||
+    !params.sessionKey.trim() ||
+    !params.flowId.trim() ||
+    !completionText ||
+    !Number.isFinite(params.acceptedAt) ||
+    !Number.isFinite(params.endedAt) ||
+    params.acceptedAt < 0 ||
+    params.endedAt < params.acceptedAt
+  ) {
+    return null;
+  }
+  if (
+    isTerminalTaskStatus(current.status) &&
+    (current.endedAt === undefined || params.acceptedAt > current.endedAt)
+  ) {
+    return null;
+  }
+  if (current.status === "succeeded") {
+    if (current.terminalSummary && current.terminalSummary !== completionText) {
+      return null;
+    }
+    if (
+      current.terminalSummary === completionText &&
+      current.terminalOutcome === "succeeded" &&
+      current.error === undefined
+    ) {
+      return cloneTaskRecord(current);
+    }
+  }
+  return updateTask(current.taskId, {
+    status: "succeeded",
+    endedAt: params.endedAt,
+    lastEventAt: Math.max(current.lastEventAt ?? 0, params.endedAt),
+    error: undefined,
+    progressSummary: completionText,
+    terminalSummary: completionText,
+    terminalOutcome: "succeeded",
+  });
+}
+
 export function setTaskRunDeliveryStatusByRunId(params: {
   runId: string;
   runtime?: TaskRuntime;
@@ -2456,6 +2530,30 @@ export function findTaskByRunId(runId: string): TaskRecord | undefined {
   return task ? cloneTaskRecord(task) : undefined;
 }
 
+/** Exact lookup that preserves durable-restore failure as an unavailable read. */
+export function findTaskByRunIdStrict(runId: string): TaskRecord | undefined {
+  restoreTaskRegistryOnce();
+  if (restoreFailed) {
+    throw restoreError;
+  }
+  ensureListener();
+  const task = pickPreferredRunIdTask(getTasksByRunId(runId));
+  return task ? cloneTaskRecord(task) : undefined;
+}
+
+/** Returns all exact run-id matches newest-first for ambiguity-safe status consumers. */
+export function listTasksByRunId(runId: string): TaskRecord[] {
+  restoreTaskRegistryOnce();
+  if (restoreFailed) {
+    throw restoreError;
+  }
+  ensureListener();
+  return getTasksByRunId(runId)
+    .map((task, insertionIndex) => Object.assign({}, cloneTaskRecord(task), { insertionIndex }))
+    .toSorted(compareTasksNewestFirst)
+    .map(({ insertionIndex: _, ...task }) => task);
+}
+
 function listTasksFromIndex(index: Map<string, Set<string>>, key: string): TaskRecord[] {
   const ids = index.get(key);
   if (!ids || ids.size === 0) {
@@ -2484,6 +2582,16 @@ export function listTasksForSessionKey(sessionKey: string): TaskRecord[] {
     return [];
   }
   return listTasksFromIndex(taskIdsByRelatedSessionKey, key);
+}
+
+export function listTasksForSessionKeyStrict(sessionKey: string): TaskRecord[] {
+  restoreTaskRegistryOnce();
+  if (restoreFailed) {
+    throw restoreError;
+  }
+  ensureListener();
+  const key = normalizeOptionalString(sessionKey);
+  return key ? listTasksFromIndex(taskIdsByRelatedSessionKey, key) : [];
 }
 
 export function listTasksForAgentId(agentId: string): TaskRecord[] {
@@ -2601,6 +2709,8 @@ export function deleteTaskRecordById(taskId: string): boolean {
 export function resetTaskRegistryForTests(opts?: { persist?: boolean }) {
   clearTaskRegistryMemory();
   restoreAttempted = false;
+  restoreError = undefined;
+  restoreFailed = false;
   resetTaskRegistryRuntimeForTests();
   if (listenerStop) {
     listenerStop();

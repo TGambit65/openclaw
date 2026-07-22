@@ -425,6 +425,12 @@ struct RootTabsSourceGuardTests {
         #expect(source.contains("workboard.cards.move"))
         #expect(source.contains("workboard.cards.archive"))
         #expect(source.contains("workboard.cards.dispatch"))
+        let dispatch = try Self.extract(
+            source,
+            from: "private func dispatchCards() async",
+            to: "private func open(_ card: IPadWorkboardCard)")
+        #expect(dispatch.contains("IPadWorkboardDispatchParams("))
+        #expect(dispatch.contains("ownerMode: \"canonical_main_no_origin\""))
         #expect(source.contains(".padding(.bottom, 12)"))
         #expect(!source.contains("Workboard gateway contract unavailable"))
         #expect(!source.contains("supportsGatewayContract"))

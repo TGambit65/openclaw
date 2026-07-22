@@ -24,6 +24,7 @@ import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { retireSessionMcpRuntimeForSessionKey } from "./agent-bundle-mcp-tools.js";
 import {
   buildAnnounceIdFromChildRun,
+  buildAnnounceIdFromCompletionObligation,
   buildAnnounceIdempotencyKey,
 } from "./announce-idempotency.js";
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
@@ -68,6 +69,7 @@ import {
   resolveSubagentRunEffectiveEndedAt,
 } from "./subagent-run-timeout.js";
 import { deleteSubagentSessionForCleanup } from "./subagent-session-cleanup.js";
+import { resolveOwnedSubagentTaskRunId } from "./subagent-task-generation.js";
 
 type CaptureSubagentCompletionReply =
   (typeof import("./subagent-announce.js"))["captureSubagentCompletionReply"];
@@ -298,12 +300,19 @@ export function createSubagentRegistryLifecycleController(params: {
     }
     const mirrorNotBefore = entry.startedAt ?? entry.createdAt;
     const mirrorNotAfter = Date.now() + 30_000;
-    const expectedIdempotencyKey = buildAnnounceIdempotencyKey(
-      buildAnnounceIdFromChildRun({
-        childSessionKey: entry.childSessionKey,
-        childRunId: entry.runId,
-      }),
-    );
+    const deliveryObligationId =
+      entry.delivery?.payload?.obligationId ?? entry.delivery?.obligationId;
+    const announceId = deliveryObligationId?.trim()
+      ? buildAnnounceIdFromCompletionObligation({
+          childSessionKey: entry.childSessionKey,
+          childRunId: entry.runId,
+          obligationId: deliveryObligationId.trim(),
+        })
+      : buildAnnounceIdFromChildRun({
+          childSessionKey: entry.childSessionKey,
+          childRunId: entry.runId,
+        });
+    const expectedIdempotencyKey = buildAnnounceIdempotencyKey(announceId);
     const isExpectedMirrorIdempotencyKey = (value: unknown): boolean =>
       typeof value === "string" &&
       (value === expectedIdempotencyKey ||
@@ -359,7 +368,7 @@ export function createSubagentRegistryLifecycleController(params: {
     entry: SubagentRunRecord,
     resolution = params.resolveSubagentTask(entry),
   ) => {
-    const durableTaskRunId = entry.taskRunId ?? entry.runId;
+    const durableTaskRunId = resolveOwnedSubagentTaskRunId(entry);
     return {
       runId:
         resolution.lookup === "available"
@@ -536,7 +545,9 @@ export function createSubagentRegistryLifecycleController(params: {
 
   const refreshFrozenResultFromSession = async (sessionKey: string): Promise<boolean> => {
     const candidates = listPendingCompletionRunsForSession(sessionKey).filter(
-      (entry) => entry.outcome?.status !== "error",
+      (entry) =>
+        entry.outcome?.status !== "error" &&
+        entry.delivery?.verifiedWorkboardCompletion === undefined,
     );
     if (candidates.length === 0) {
       return false;
@@ -557,6 +568,11 @@ export function createSubagentRegistryLifecycleController(params: {
     const capturedAt = Date.now();
     let changed = false;
     for (const entry of candidates) {
+      // The trusted Workboard arm freezes an immutable payload. Recheck after
+      // transcript capture yields so a concurrent arm cannot be overwritten.
+      if (entry.delivery?.verifiedWorkboardCompletion) {
+        continue;
+      }
       const completion = ensureCompletionState(entry);
       if (completion.resultText === nextFrozen) {
         continue;
@@ -602,7 +618,11 @@ export function createSubagentRegistryLifecycleController(params: {
     delivery.lastError = undefined;
     delivery.suspendedAt = undefined;
     delivery.suspendedReason = undefined;
-    if (delivery.status !== "delivered" && delivery.status !== "failed") {
+    if (
+      !delivery.verifiedWorkboardCompletion &&
+      delivery.status !== "delivered" &&
+      delivery.status !== "failed"
+    ) {
       clearDeliveryState(entry);
     }
   };
@@ -611,6 +631,7 @@ export function createSubagentRegistryLifecycleController(params: {
     entry: SubagentRunRecord,
   ): PendingFinalDeliveryPayload => {
     return {
+      obligationId: entry.delivery?.payload?.obligationId ?? entry.delivery?.obligationId,
       requesterSessionKey:
         entry.delivery?.payload?.requesterSessionKey ?? entry.requesterSessionKey,
       requesterOrigin: entry.delivery?.payload?.requesterOrigin ?? entry.requesterOrigin,
@@ -651,6 +672,7 @@ export function createSubagentRegistryLifecycleController(params: {
     const delivery = entry.delivery;
     if (
       !delivery?.payload ||
+      delivery.verifiedWorkboardCompletion ||
       delivery.status === "delivered" ||
       typeof delivery.announcedAt === "number"
     ) {
@@ -1277,6 +1299,7 @@ export function createSubagentRegistryLifecycleController(params: {
       .runSubagentAnnounceFlow({
         childSessionKey: pendingPayload.childSessionKey,
         childRunId: pendingPayload.childRunId,
+        deliveryObligationId: pendingPayload.obligationId,
         requesterSessionKey: pendingPayload.requesterSessionKey,
         requesterOrigin,
         requesterDisplayKey: pendingPayload.requesterDisplayKey,
@@ -1373,6 +1396,14 @@ export function createSubagentRegistryLifecycleController(params: {
       if (!entry) {
         return;
       }
+      const verifiedWorkboardIntent = entry.delivery?.verifiedWorkboardCompletion;
+      if (verifiedWorkboardIntent) {
+        // The arm freezes the result but does not claim physical execution has
+        // ended. This lifecycle callback is the execution fence: from here on
+        // the immutable verified result wins over any trailing model text or
+        // stop/error outcome from the same turn.
+        completionReason = SUBAGENT_ENDED_REASON_COMPLETE;
+      }
       const currentEntry = entry;
       entrySnapshot = structuredClone(entry);
       const restoreEntrySnapshot = (snapshot?: SubagentRunRecord) => {
@@ -1399,6 +1430,7 @@ export function createSubagentRegistryLifecycleController(params: {
       let requestedEndedAt =
         typeof completeParams.endedAt === "number" ? completeParams.endedAt : Date.now();
       if (
+        !verifiedWorkboardIntent &&
         shouldPreservePublishedExplicitRunTimeout({
           entry,
         })
@@ -1418,8 +1450,11 @@ export function createSubagentRegistryLifecycleController(params: {
         completionReason = entry.endedReason ?? completeParams.reason;
       }
       let endedAt = requestedEndedAt;
-      let completionOutcome =
-        shouldDrainExistingTerminal && entry.outcome ? entry.outcome : completeParams.outcome;
+      let completionOutcome = verifiedWorkboardIntent
+        ? ({ status: "ok" } as const)
+        : shouldDrainExistingTerminal && entry.outcome
+          ? entry.outcome
+          : completeParams.outcome;
       const observedStartedAt =
         !shouldDrainExistingTerminal &&
         typeof completeParams.startedAt === "number" &&
@@ -1446,6 +1481,7 @@ export function createSubagentRegistryLifecycleController(params: {
         return;
       }
       const isSteerRestartKill =
+        !verifiedWorkboardIntent &&
         completeParams.reason === SUBAGENT_ENDED_REASON_KILLED &&
         entry.suppressAnnounceReason === "steer-restart";
       suppressTaskFinalization = isSteerRestartKill;

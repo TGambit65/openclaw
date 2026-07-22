@@ -1,5 +1,6 @@
 // Plugin runtime types describe activated plugin capabilities exposed to core execution.
 import type { OperatorScope } from "../../gateway/operator-scopes.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import type { PluginRuntimeCore, RuntimeLogger } from "./types-core.js";
 
 export type { RuntimeLogger };
@@ -19,6 +20,8 @@ export type SubagentRunParams = {
   deliver?: boolean;
   idempotencyKey?: string;
   cwd?: string;
+  parentFlowId?: string;
+  flowOwnerSessionKey?: string;
 };
 
 export type PluginManagedWorktree = {
@@ -39,6 +42,130 @@ export type SubagentWaitParams = {
 export type SubagentWaitResult = {
   status: "ok" | "error" | "timeout";
   error?: string;
+};
+
+export type SubagentRecoveryOwnershipParams = {
+  sessionKey: string;
+  runId: string;
+};
+
+export type SubagentRecoveryOwnershipResult = {
+  status: "unknown" | "core_owned" | "successor" | "exhausted";
+  successorRunId?: string;
+  error?: string;
+};
+
+export type SubagentResolveOwnerSessionParams = {
+  sessionKey: string;
+};
+
+export type SubagentResolveOwnerSessionResult =
+  | {
+      status: "resolved";
+      workerSessionKey: string;
+      ownerSessionKey: string;
+      workspaceDir: string;
+    }
+  | { status: "unknown" };
+
+export type SubagentRunStateParams = {
+  sessionKey: string;
+  runId: string;
+};
+
+export type SubagentVerifiedCompletionProof = {
+  id: string;
+  status: "passed";
+  createdAt: number;
+  label?: string;
+  command?: string;
+  url?: string;
+  note?: string;
+};
+
+export type SubagentVerifiedCompletionArtifact = {
+  id: string;
+  createdAt: number;
+  path: string;
+  byteSize: number;
+  sha256: string;
+  verifiedAt: number;
+  label?: string;
+  url?: string;
+  mimeType?: string;
+};
+
+export type SubagentVerifiedCompletionIntent = {
+  kind: "verified_workboard_completion";
+  obligationId: string;
+  payloadHash: string;
+  acceptedAt: number;
+  cardId: string;
+  childSessionKey: string;
+  runId: string;
+  expectedRunId: string;
+  expectedRevision: string;
+  claimOwnerId: string;
+  summary: string;
+  completionText: string;
+  proof: SubagentVerifiedCompletionProof;
+  artifacts: SubagentVerifiedCompletionArtifact[];
+  createdCardIds: string[];
+  flowId: string;
+  flowOwnerSessionKey: string;
+  requesterSessionKey: string;
+  requesterOrigin?: DeliveryContext;
+  flowRevision: number;
+  controllerId: "workboard";
+};
+
+export type SubagentRequireCompletionDeliveryParams = {
+  sessionKey: string;
+  runId: string;
+  idempotencyKey: string;
+  cardId: string;
+  expectedRunId: string;
+  expectedRevision: string;
+  claimOwnerId: string;
+  summary: string;
+  completionText: string;
+  proof: SubagentVerifiedCompletionProof;
+  artifacts: SubagentVerifiedCompletionArtifact[];
+  createdCardIds: string[];
+  flowId: string;
+  flowOwnerSessionKey: string;
+  flowRevision: number;
+  controllerId: "workboard";
+};
+
+export type SubagentCompletionDeliveryStatus =
+  | "not_required"
+  | "pending"
+  | "in_progress"
+  | "delivered"
+  | "failed"
+  | "suspended"
+  | "discarded";
+
+export type SubagentRequireCompletionDeliveryResult =
+  | {
+      status: "armed" | "already_armed" | "delivered";
+      deliveryStatus: SubagentCompletionDeliveryStatus;
+      deliveredAt?: number;
+      verifiedCompletionIntent: SubagentVerifiedCompletionIntent;
+    }
+  | { status: "unknown"; error?: string };
+
+export type SubagentRunStateResult = {
+  status: "unknown" | "absent" | "active" | "terminal";
+  outcome?: "ok" | "error" | "timeout" | "killed";
+  error?: string;
+  deliveryStatus?: SubagentCompletionDeliveryStatus;
+  deliveredAt?: number;
+  deliveryError?: string;
+  discardReason?: "expired" | "pressure-pruned";
+  deliveryObligationId?: string;
+  verifiedCompletionIntent?: SubagentVerifiedCompletionIntent;
 };
 
 export type SubagentGetSessionMessagesParams = {
@@ -104,7 +231,17 @@ export type PluginRuntime = PluginRuntimeCore & {
   };
   subagent: {
     run: (params: SubagentRunParams) => Promise<SubagentRunResult>;
+    resolveOwnerSession: (
+      params: SubagentResolveOwnerSessionParams,
+    ) => Promise<SubagentResolveOwnerSessionResult>;
     waitForRun: (params: SubagentWaitParams) => Promise<SubagentWaitResult>;
+    getRecoveryOwnership: (
+      params: SubagentRecoveryOwnershipParams,
+    ) => Promise<SubagentRecoveryOwnershipResult>;
+    getRunState: (params: SubagentRunStateParams) => Promise<SubagentRunStateResult>;
+    requireCompletionDelivery: (
+      params: SubagentRequireCompletionDeliveryParams,
+    ) => Promise<SubagentRequireCompletionDeliveryResult>;
     getSessionMessages: (
       params: SubagentGetSessionMessagesParams,
     ) => Promise<SubagentGetSessionMessagesResult>;

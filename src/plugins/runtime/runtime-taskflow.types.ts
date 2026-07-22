@@ -20,7 +20,8 @@ export type ManagedTaskFlowMutationErrorCode =
   | "not_found"
   | "not_managed"
   | "revision_conflict"
-  | "persist_failed";
+  | "persist_failed"
+  | "completion_cancel_conflict";
 
 export type ManagedTaskFlowMutationResult =
   | {
@@ -87,6 +88,7 @@ export type BoundTaskFlowRuntime = {
     blockedTaskId?: string | null;
     blockedSummary?: string | null;
     updatedAt?: number;
+    completionAcceptedAt?: number;
   }) => ManagedTaskFlowMutationResult;
   resume: (params: {
     flowId: string;
@@ -102,6 +104,7 @@ export type BoundTaskFlowRuntime = {
     stateJson?: JsonValue | null;
     updatedAt?: number;
     endedAt?: number;
+    completionAcceptedAt?: number;
   }) => ManagedTaskFlowMutationResult;
   fail: (params: {
     flowId: string;
@@ -111,6 +114,7 @@ export type BoundTaskFlowRuntime = {
     blockedSummary?: string | null;
     updatedAt?: number;
     endedAt?: number;
+    completionAcceptedAt?: number;
   }) => ManagedTaskFlowMutationResult;
   requestCancel: (params: {
     flowId: string;

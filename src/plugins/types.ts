@@ -1992,6 +1992,8 @@ export type PluginCommandContext = {
   gatewayClientScopes?: string[];
   /** Host-resolved agent that owns the active session. */
   agentId?: string;
+  /** Host-resolved workspace for the active session. */
+  workspaceDir?: string;
   /** Stable host session key for the active conversation when available. */
   sessionKey?: string;
   /** Ephemeral host session id for the active conversation when available. */

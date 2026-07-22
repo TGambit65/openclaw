@@ -12,6 +12,8 @@ import {
   type DetachedTaskFindResult,
 } from "../tasks/detached-task-runtime-contract.js";
 import { createRunningTaskRun, finalizeTaskRunByRunId } from "../tasks/detached-task-runtime.js";
+import { deleteTaskRecordById } from "../tasks/task-registry.js";
+import type { TaskRecord } from "../tasks/task-registry.types.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import { buildAgentRunTerminalOutcomeFromWaitResult } from "./agent-run-terminal-outcome.js";
@@ -47,6 +49,10 @@ import {
 } from "./subagent-run-generation.js";
 import { resolveSubagentRunDeadlineMs } from "./subagent-run-timeout.js";
 import type { SubagentSessionCompletion } from "./subagent-session-reconciliation.js";
+import {
+  resolveOwnedSubagentTaskRunId,
+  tryCreateRecoveredSubagentTaskGeneration,
+} from "./subagent-task-generation.js";
 
 const log = createSubsystemLogger("agents/subagent-registry");
 const RECOVERABLE_WAIT_RETRY_DELAY_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 25 : 5_000;
@@ -105,6 +111,9 @@ export function markSubagentRunPausedAfterYield(params: {
   now?: number;
 }): boolean {
   const { entry } = params;
+  if (entry.delivery?.verifiedWorkboardCompletion) {
+    return false;
+  }
   if (
     entry.endedReason === SUBAGENT_ENDED_REASON_KILLED ||
     entry.suppressAnnounceReason === "killed" ||
@@ -183,6 +192,9 @@ export type RegisterSubagentRunParams = {
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;
+  parentFlowId?: string;
+  /** Fail before model dispatch unless the exact flow-linked task is durable. */
+  requireDurableTask?: boolean;
 };
 
 export function createSubagentRunManager(params: {
@@ -514,6 +526,9 @@ export function createSubagentRunManager(params: {
     if (!entry) {
       return false;
     }
+    if (entry.delivery?.verifiedWorkboardCompletion) {
+      return false;
+    }
     if (entry.suppressAnnounceReason === "steer-restart") {
       return true;
     }
@@ -547,7 +562,7 @@ export function createSubagentRunManager(params: {
             }
           : resolveFinalizedSubagentTaskState(entry);
       if (terminal) {
-        const targetRunId = task?.runId ?? entry.taskRunId ?? entry.runId;
+        const targetRunId = task?.runId ?? resolveOwnedSubagentTaskRunId(entry);
         const targetSessionKey = task?.childSessionKey ?? entry.childSessionKey;
         try {
           finalizeTaskRunByRunId({
@@ -585,6 +600,9 @@ export function createSubagentRunManager(params: {
     fallback?: SubagentRunRecord;
     runTimeoutSeconds?: number;
     preserveFrozenResultFallback?: boolean;
+    requireDurableReplacement?: boolean;
+    createFreshTaskGeneration?: boolean;
+    taskGenerationAlreadyCreated?: boolean;
     transcriptFile?: string;
     task?: string;
   }) => {
@@ -597,6 +615,17 @@ export function createSubagentRunManager(params: {
     const previous = params.runs.get(previousRunId);
     const source = previous ?? replaceParams.fallback;
     if (!source) {
+      return false;
+    }
+    if (source.delivery?.verifiedWorkboardCompletion) {
+      return false;
+    }
+    const sourceOrphanRecovery = source.orphanRecovery;
+    if (
+      sourceOrphanRecovery?.status === "core_owned" &&
+      sourceOrphanRecovery.predecessorRunId === previousRunId &&
+      sourceOrphanRecovery.successorRunId !== nextRunId
+    ) {
       return false;
     }
 
@@ -639,13 +668,91 @@ export function createSubagentRunManager(params: {
       typeof replaceParams.task === "string" && replaceParams.task.length > 0
         ? replaceParams.task
         : source.task;
+    const createFreshTaskGeneration = replaceParams.createFreshTaskGeneration === true;
+    let nextTaskRunId = source.taskRunId;
+    let taskGenerationRecovery: SubagentRunRecord["taskGenerationRecovery"];
+    if (createFreshTaskGeneration) {
+      try {
+        const previousTask = params.resolveSubagentTask(source).task;
+        const preparedTask = replaceParams.taskGenerationAlreadyCreated
+          ? params.resolveSubagentTask({
+              ...source,
+              runId: nextRunId,
+              taskRunId: nextRunId,
+            }).task
+          : undefined;
+        const creation = preparedTask
+          ? { task: preparedTask as TaskRecord, error: undefined }
+          : tryCreateRecoveredSubagentTaskGeneration({
+              entry: source,
+              runId: nextRunId,
+              task: nextTask,
+              startedAt: now,
+              previousTask,
+            });
+        if (
+          creation.task &&
+          creation.task.runId === nextRunId &&
+          creation.task.runtime === "subagent" &&
+          creation.task.childSessionKey === source.childSessionKey &&
+          creation.task.status === "running" &&
+          (creation.task.parentFlowId ?? "") === (previousTask?.parentFlowId ?? "")
+        ) {
+          nextTaskRunId = nextRunId;
+        } else {
+          const creationError = creation.task
+            ? "prepared task generation did not match the recovered run"
+            : creation.error;
+          taskGenerationRecovery = {
+            runId: nextRunId,
+            requestedAt: now,
+            lastAttemptAt: now,
+            attemptCount: 1,
+            lastError: creationError,
+          };
+          log.warn("Failed to persist fresh task generation for recovered subagent run", {
+            previousRunId,
+            nextRunId,
+            childSessionKey: source.childSessionKey,
+            error: creationError,
+          });
+        }
+      } catch (error) {
+        taskGenerationRecovery = {
+          runId: nextRunId,
+          requestedAt: now,
+          lastAttemptAt: now,
+          attemptCount: 1,
+          lastError: String(error),
+        };
+        log.warn("Failed to create fresh task generation for recovered subagent run", {
+          error,
+          previousRunId,
+          nextRunId,
+          childSessionKey: source.childSessionKey,
+        });
+      }
+    }
     const next: SubagentRunRecord = normalizeSubagentRunState({
       ...source,
       runId: nextRunId,
-      // New rows carry an exact owner. Legacy replacement rows must retain an
-      // unknown owner so their bounded session fallback can still find the
-      // original detached task across another restart.
-      taskRunId: source.taskRunId,
+      // Restart recovery owns a fresh task attempt. Ordinary steer/wake rows
+      // retain their prior owner (including undefined for legacy session
+      // fallback) so existing continuation behavior stays unchanged.
+      taskRunId: nextTaskRunId,
+      taskGenerationRecovery,
+      orphanRecovery:
+        sourceOrphanRecovery?.status === "core_owned" &&
+        sourceOrphanRecovery.predecessorRunId === previousRunId &&
+        sourceOrphanRecovery.successorRunId === nextRunId
+          ? {
+              ...sourceOrphanRecovery,
+              status: "successor",
+              updatedAt: now,
+              settledAt: now,
+              error: undefined,
+            }
+          : sourceOrphanRecovery,
       task: nextTask,
       generation,
       createdAt: now,
@@ -688,10 +795,24 @@ export function createSubagentRunManager(params: {
       params.runs.delete(previousRunId);
     }
     params.runs.set(nextRunId, next);
-    markOlderKillReconciliationsSuperseded(next);
+    const killReconciliationSnapshots = markOlderKillReconciliationsSuperseded(next);
     try {
       params.persistOrThrow();
     } catch (error) {
+      if (replaceParams.requireDurableReplacement === true) {
+        params.runs.delete(nextRunId);
+        params.runs.set(previousRunId, source);
+        restoreKillReconciliationSnapshots(killReconciliationSnapshots);
+        log.warn(
+          "failed to persist durable replacement subagent run; retaining predecessor claim",
+          {
+            error,
+            previousRunId,
+            nextRunId,
+          },
+        );
+        return false;
+      }
       // The gateway has already started nextRunId. Keep its in-memory owner
       // authoritative and retry best-effort persistence; rolling back here
       // would orphan a live run that can still mutate the shared session.
@@ -722,13 +843,15 @@ export function createSubagentRunManager(params: {
     return true;
   };
 
-  const registerSubagentRun = (registerParams: RegisterSubagentRunParams) => {
+  const registerSubagentRun = (
+    registerParams: RegisterSubagentRunParams,
+  ): SubagentRunRecord | undefined => {
     const runId = registerParams.runId.trim();
     const childSessionKey = registerParams.childSessionKey.trim();
     const requesterSessionKey = registerParams.requesterSessionKey.trim();
     const controllerSessionKey = registerParams.controllerSessionKey?.trim() || requesterSessionKey;
     if (!runId || !childSessionKey || !requesterSessionKey) {
-      return;
+      return undefined;
     }
     const now = Date.now();
     const generation = nextSubagentRunGeneration(params.runs.values(), childSessionKey);
@@ -784,22 +907,16 @@ export function createSubagentRunManager(params: {
       attachmentsRootDir: registerParams.attachmentsRootDir,
       retainAttachmentsOnKeep: registerParams.retainAttachmentsOnKeep,
     });
-    params.runs.set(runId, entry);
-    const killReconciliationSnapshots = markOlderKillReconciliationsSuperseded(entry);
-    try {
-      params.persistOrThrow();
-    } catch (error) {
-      params.runs.delete(runId);
-      restoreKillReconciliationSnapshots(killReconciliationSnapshots);
-      throw error;
-    }
-    try {
-      const task = createRunningTaskRun({
+    const parentFlowId = registerParams.parentFlowId?.trim();
+    const requireDurableTask = registerParams.requireDurableTask === true;
+    const createTask = () =>
+      createRunningTaskRun({
         runtime: "subagent",
         sourceId: runId,
         ownerKey: requesterSessionKey,
         scopeKind: "session",
         requesterOrigin,
+        ...(parentFlowId ? { parentFlowId } : {}),
         childSessionKey,
         runId,
         label: registerParams.label,
@@ -811,16 +928,114 @@ export function createSubagentRunManager(params: {
         startedAt: now,
         lastEventAt: now,
       });
+    const isExactDurableTask = (task: TaskRecord | null | undefined): task is TaskRecord =>
+      Boolean(
+        task &&
+        task.runtime === "subagent" &&
+        task.runId === runId &&
+        task.childSessionKey === childSessionKey &&
+        task.ownerKey === requesterSessionKey &&
+        task.parentFlowId === parentFlowId &&
+        task.status === "running",
+      );
+    const failTaskBeforeDispatch = (task: TaskRecord | undefined, error: string) => {
       if (!task) {
-        log.warn("Failed to persist background task for subagent run", {
-          runId: registerParams.runId,
+        return;
+      }
+      // Core task rows are safe to delete here because no model dispatch has
+      // been admitted yet. Deletion avoids poisoning the same idempotency key:
+      // createTask would otherwise reuse a terminal rollback row forever.
+      if (deleteTaskRecordById(task.taskId)) {
+        return;
+      }
+      try {
+        finalizeTaskRunByRunId({
+          runId: task.runId ?? runId,
+          runtime: "subagent",
+          sessionKey: task.childSessionKey ?? childSessionKey,
+          status: "failed",
+          endedAt: Date.now(),
+          lastEventAt: Date.now(),
+          error,
+          suppressDelivery: true,
+        });
+      } catch (finalizeError) {
+        log.warn("failed to terminalize rejected durable subagent task", {
+          runId,
+          error: finalizeError,
         });
       }
+    };
+
+    let durableTask: TaskRecord | undefined;
+    if (requireDurableTask) {
+      if (!parentFlowId) {
+        throw new Error("strict subagent task registration requires parentFlowId");
+      }
+      // Managed TaskFlow admission is the only authority allowed to create a
+      // strict Workboard task. The gateway performs that owner-scoped
+      // admission before registering the execution correlation here.
+      const admitted = params.resolveSubagentTask(entry);
+      if (admitted.lookup !== "available" || !isExactDurableTask(admitted.task)) {
+        if (admitted.task) {
+          failTaskBeforeDispatch(admitted.task, "Exact durable subagent task registration failed.");
+        }
+        throw new Error("exact durable subagent task was not admitted by its parent flow");
+      }
+      durableTask = admitted.task;
+    }
+
+    params.runs.set(runId, entry);
+    const killReconciliationSnapshots = markOlderKillReconciliationsSuperseded(entry);
+    try {
+      params.persistOrThrow();
     } catch (error) {
-      log.warn("Failed to create background task for subagent run", {
-        runId: registerParams.runId,
-        error,
-      });
+      params.runs.delete(runId);
+      restoreKillReconciliationSnapshots(killReconciliationSnapshots);
+      if (durableTask) {
+        failTaskBeforeDispatch(
+          durableTask,
+          "Subagent registry persistence failed before model dispatch.",
+        );
+      }
+      throw error;
+    }
+    if (requireDurableTask) {
+      const exact = params.resolveSubagentTask(entry);
+      if (exact.lookup !== "available" || !isExactDurableTask(exact.task)) {
+        params.runs.delete(runId);
+        restoreKillReconciliationSnapshots(killReconciliationSnapshots);
+        let rollbackError: unknown;
+        try {
+          params.persistOrThrow();
+        } catch (error) {
+          rollbackError = error;
+        }
+        failTaskBeforeDispatch(
+          durableTask,
+          "Exact durable subagent task verification failed before model dispatch.",
+        );
+        if (rollbackError) {
+          throw new Error("failed to roll back an unverifiable durable subagent registration", {
+            cause: rollbackError,
+          });
+        }
+        throw new Error("exact durable subagent task could not be verified");
+      }
+    } else {
+      try {
+        const task = createTask();
+        if (!task) {
+          log.warn("Failed to persist background task for subagent run", {
+            runId: registerParams.runId,
+          });
+        }
+      } catch (error) {
+        log.warn("Failed to create background task for subagent run", {
+          runId: registerParams.runId,
+          error,
+        });
+      }
     }
     params.ensureListener();
     params.persist();
@@ -829,6 +1044,7 @@ export function createSubagentRunManager(params: {
     // Wait for subagent completion via gateway RPC (cross-process).
     // The in-process lifecycle listener is a fallback for embedded runs.
     void waitForSubagentCompletion(runId, waitTimeoutMs, entry);
+    return entry;
   };
 
   const releaseSubagentRun = (runId: string) => {
@@ -884,7 +1100,7 @@ export function createSubagentRunManager(params: {
     const finalizeKilledTask = (entry: SubagentRunRecord, endedAt: number) => {
       const taskResolution = params.resolveSubagentTask(entry);
       const task = taskResolution.lookup === "available" ? taskResolution.task : undefined;
-      const targetRunId = task?.runId ?? entry.taskRunId ?? entry.runId;
+      const targetRunId = task?.runId ?? resolveOwnedSubagentTaskRunId(entry);
       const targetSessionKey = task?.childSessionKey ?? entry.childSessionKey;
       try {
         finalizeTaskRunByRunId({

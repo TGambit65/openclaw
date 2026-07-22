@@ -57,6 +57,9 @@ const UNRESUMABLE_SESSION_NOTICE =
   "Please send that last request again and I'll pick it up cleanly.";
 
 function shouldSkipMainRecovery(entry: SessionEntry, sessionKey: string): boolean {
+  if (normalizeOptionalString(entry.heartbeatIsolatedBaseSessionKey)) {
+    return true;
+  }
   if (typeof entry.spawnDepth === "number" && entry.spawnDepth > 0) {
     return true;
   }
@@ -526,6 +529,19 @@ async function sendUnresumableSessionNotice(params: {
   }
 }
 
+async function hasDurableWorkboardCompletionOwner(sessionKey: string): Promise<boolean> {
+  try {
+    const { hasDurableWorkboardCompletionOwnerForRequester } =
+      await import("./subagent-registry.js");
+    return hasDurableWorkboardCompletionOwnerForRequester(sessionKey);
+  } catch (err) {
+    log.warn(
+      `failed to verify durable Workboard completion ownership for ${sessionKey}: ${String(err)}`,
+    );
+    return false;
+  }
+}
+
 function resolveRestartRecoveryDeliveryContext(params: {
   cfg?: OpenClawConfig;
   entry: SessionEntry;
@@ -724,6 +740,7 @@ async function recoverStore(params: {
   resumedSessionKeys: Set<string>;
   activeSessionIds?: Iterable<string>;
   activeSessionKeys?: Iterable<string>;
+  hasDurableCompletionOwner: (sessionKey: string) => boolean | Promise<boolean>;
 }): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
   const providedActiveSessionIds =
@@ -823,12 +840,26 @@ async function recoverStore(params: {
 
     const resumeBlockReason = resolveMainSessionResumeBlockReason(messages);
     if (resumeBlockReason) {
-      await sendUnresumableSessionNotice({
-        cfg: params.cfg,
-        entry,
-        sessionKey,
-        reason: resumeBlockReason,
-      });
+      let durableCompletionOwner = false;
+      try {
+        durableCompletionOwner = await params.hasDurableCompletionOwner(sessionKey);
+      } catch (err) {
+        // Notice suppression is fail closed. Registry/storage ambiguity must
+        // retain the ordinary interruption notice for the requester.
+        log.warn(`failed to prove durable completion ownership for ${sessionKey}: ${String(err)}`);
+      }
+      if (!durableCompletionOwner) {
+        await sendUnresumableSessionNotice({
+          cfg: params.cfg,
+          entry,
+          sessionKey,
+          reason: resumeBlockReason,
+        });
+      } else {
+        log.info(
+          `suppressed generic interrupted-session notice for durable Workboard owner: ${sessionKey}`,
+        );
+      }
       await markSessionFailed({
         storePath: params.storePath,
         sessionKey,
@@ -881,6 +912,7 @@ export async function recoverRestartAbortedMainSessions(
     resumedSessionKeys?: Set<string>;
     activeSessionIds?: Iterable<string>;
     activeSessionKeys?: Iterable<string>;
+    hasDurableCompletionOwner?: (sessionKey: string) => boolean | Promise<boolean>;
   } = {},
 ): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
@@ -893,6 +925,8 @@ export async function recoverRestartAbortedMainSessions(
       resumedSessionKeys,
       activeSessionIds: params.activeSessionIds,
       activeSessionKeys: params.activeSessionKeys,
+      hasDurableCompletionOwner:
+        params.hasDurableCompletionOwner ?? hasDurableWorkboardCompletionOwner,
     });
     result.recovered += storeResult.recovered;
     result.failed += storeResult.failed;
@@ -915,6 +949,7 @@ export async function recoverStartupOrphanedMainSessions(
     activeSessionKeys?: Iterable<string>;
     updatedBeforeMs?: number;
     resumedSessionKeys?: Set<string>;
+    hasDurableCompletionOwner?: (sessionKey: string) => boolean | Promise<boolean>;
   } = {},
 ): Promise<{ marked: number; recovered: number; failed: number; skipped: number }> {
   const startupRecoveryCutoffMs = params.updatedBeforeMs ?? Date.now();
@@ -931,6 +966,9 @@ export async function recoverStartupOrphanedMainSessions(
     resumedSessionKeys: params.resumedSessionKeys,
     activeSessionIds: params.activeSessionIds,
     activeSessionKeys: params.activeSessionKeys,
+    ...(params.hasDurableCompletionOwner
+      ? { hasDurableCompletionOwner: params.hasDurableCompletionOwner }
+      : {}),
   });
   return {
     marked: marked.marked,

@@ -176,6 +176,7 @@ function createBoundTaskFlowRuntime(params: {
           blockedTaskId: input.blockedTaskId,
           blockedSummary: input.blockedSummary,
           updatedAt: input.updatedAt,
+          completionAcceptedAt: input.completionAcceptedAt,
         }),
       );
     },
@@ -221,6 +222,7 @@ function createBoundTaskFlowRuntime(params: {
           stateJson: input.stateJson,
           updatedAt: input.updatedAt,
           endedAt: input.endedAt,
+          completionAcceptedAt: input.completionAcceptedAt,
         }),
       );
     },
@@ -245,6 +247,7 @@ function createBoundTaskFlowRuntime(params: {
           blockedSummary: input.blockedSummary,
           updatedAt: input.updatedAt,
           endedAt: input.endedAt,
+          completionAcceptedAt: input.completionAcceptedAt,
         }),
       );
     },

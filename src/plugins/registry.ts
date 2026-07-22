@@ -2778,8 +2778,18 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
         const subagent = getRuntimeProperty();
         return {
           run: (params) => withPluginRuntimePluginIdScope(pluginId, () => subagent.run(params)),
+          resolveOwnerSession: (params) =>
+            withPluginRuntimePluginIdScope(pluginId, () => subagent.resolveOwnerSession(params)),
           waitForRun: (params) =>
             withPluginRuntimePluginIdScope(pluginId, () => subagent.waitForRun(params)),
+          getRecoveryOwnership: (params) =>
+            withPluginRuntimePluginIdScope(pluginId, () => subagent.getRecoveryOwnership(params)),
+          getRunState: (params) =>
+            withPluginRuntimePluginIdScope(pluginId, () => subagent.getRunState(params)),
+          requireCompletionDelivery: (params) =>
+            withPluginRuntimePluginIdScope(pluginId, () =>
+              subagent.requireCompletionDelivery(params),
+            ),
           getSessionMessages: (params) =>
             withPluginRuntimePluginIdScope(pluginId, () => subagent.getSessionMessages(params)),
           getSession: (params) =>

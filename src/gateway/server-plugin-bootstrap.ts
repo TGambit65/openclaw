@@ -57,7 +57,7 @@ type GatewayPluginBootstrapParams = {
 
 function installGatewayPluginRuntimeEnvironment(cfg: OpenClawConfig) {
   setPluginSubagentOverridePolicies(cfg);
-  setGatewaySubagentRuntime(createGatewaySubagentRuntime());
+  setGatewaySubagentRuntime(createGatewaySubagentRuntime(cfg));
   setGatewayNodesRuntime(createGatewayNodesRuntime());
 }
 

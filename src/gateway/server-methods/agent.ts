@@ -111,6 +111,7 @@ import type { PluginHookSessionEndReason } from "../../plugins/hook-types.js";
 import {
   classifySessionKeyShape,
   isAcpSessionKey,
+  isSubagentSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
@@ -130,8 +131,13 @@ import {
   beginSessionWorkAdmission,
   type SessionWorkAdmissionLease,
 } from "../../sessions/session-lifecycle-admission.js";
+import { SUBAGENT_KILL_TASK_ERROR } from "../../tasks/detached-task-runtime-contract.js";
 import { createRunningTaskRun, finalizeTaskRunByRunId } from "../../tasks/detached-task-runtime.js";
+import { runTaskInFlowForOwner } from "../../tasks/task-executor.js";
+import { getTaskFlowByIdForOwner } from "../../tasks/task-flow-owner-access.js";
+import { deleteTaskRecordById } from "../../tasks/task-registry.js";
 import type { TaskStatus } from "../../tasks/task-registry.types.js";
+import { listTasksByRunIdForStatus } from "../../tasks/task-status-access.js";
 import {
   mergeDeliveryContext,
   normalizeDeliveryContext,
@@ -159,6 +165,7 @@ import {
 } from "../chat-attachments.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
+import { resolvePluginSubagentSessionIdentity } from "../plugin-subagent-session-identity.js";
 import {
   emitGatewaySessionEndPluginHook,
   emitGatewaySessionStartPluginHook,
@@ -177,7 +184,7 @@ import {
   resolveSessionModelRef,
 } from "../session-utils.js";
 import { formatForLog } from "../ws-log.js";
-import { waitForAgentJob } from "./agent-job.js";
+import { inspectAgentJobState, waitForAgentJob } from "./agent-job.js";
 import {
   readTerminalSnapshotFromGatewayDedupe,
   setGatewayDedupeEntry,
@@ -191,6 +198,64 @@ import type {
   GatewayRequestHandlerOptions,
   GatewayRequestHandlers,
 } from "./types.js";
+
+function readTerminalSnapshotFromDurableSubagentTask(
+  runId: string,
+): AgentWaitTerminalSnapshot | null {
+  const matches = listTasksByRunIdForStatus(runId);
+  if (
+    matches.length === 0 ||
+    matches.some((task) => task.status === "queued" || task.status === "running")
+  ) {
+    return null;
+  }
+  const newestCreatedAt = matches[0]?.createdAt;
+  const newest = matches.filter((task) => task.createdAt === newestCreatedAt);
+  if (newest.length !== 1 || newest[0]?.runtime !== "subagent") {
+    return null;
+  }
+  const task = newest[0];
+
+  const common = {
+    startedAt: task.startedAt,
+    endedAt: task.endedAt,
+  };
+  switch (task.status) {
+    case "succeeded":
+      return { status: "ok", ...common };
+    case "failed":
+    case "lost":
+      return {
+        status: "error",
+        ...common,
+        error:
+          task.error ??
+          task.terminalSummary ??
+          `Detached subagent task ended with status ${task.status}.`,
+      };
+    case "timed_out":
+      return {
+        status: "timeout",
+        ...common,
+        error: task.error ?? task.terminalSummary,
+        stopReason: "timeout",
+      };
+    case "cancelled":
+      if (task.error === SUBAGENT_KILL_TASK_ERROR) {
+        return null;
+      }
+      return {
+        status: "error",
+        ...common,
+        error: task.error ?? task.terminalSummary ?? "Detached subagent task was cancelled.",
+        stopReason: "aborted",
+      };
+    case "queued":
+    case "running":
+      return null;
+  }
+  return null;
+}
 
 const RESET_COMMAND_RE = /^\/(new|reset)(?:\s+([\s\S]*))?$/i;
 
@@ -728,29 +793,123 @@ async function registerPluginSubagentRunFromGateway(params: {
   task: string;
   requesterOrigin?: DeliveryContext;
   pluginId?: string;
+  parentFlowId?: string;
+  flowOwnerSessionKey?: string;
+  workspaceDir?: string;
 }): Promise<void> {
   const childSessionKey = params.childSessionKey.trim();
   if (!childSessionKey) {
     return;
   }
-  const ownerSessionKey = resolveAgentMainSessionKey({
+  const identity = resolvePluginSubagentSessionIdentity({
     cfg: params.cfg,
-    agentId: resolveAgentIdFromSessionKey(childSessionKey),
+    sessionKey: childSessionKey,
   });
+  if (!identity || identity.workerSessionKey !== childSessionKey) {
+    throw new Error("plugin subagent session identity is not canonical");
+  }
+  const parentFlowId = normalizeOptionalString(params.parentFlowId);
+  const flowOwnerSessionKey = normalizeOptionalString(params.flowOwnerSessionKey);
+  if (Boolean(parentFlowId) !== Boolean(flowOwnerSessionKey)) {
+    throw new Error("managed-flow linkage fields must be provided together");
+  }
+  let managedFlow: ReturnType<typeof getTaskFlowByIdForOwner> = undefined;
+  let admittedTaskId: string | undefined;
+  if (parentFlowId && flowOwnerSessionKey) {
+    if (params.pluginId !== "workboard") {
+      throw new Error("managed-flow linkage is reserved for Workboard");
+    }
+    const canonicalFlowOwner = resolveSessionStoreKey({
+      cfg: params.cfg,
+      sessionKey: flowOwnerSessionKey,
+    });
+    const workerAgentId = parseAgentSessionKey(identity.workerSessionKey)?.agentId;
+    const ownerAgentId = parseAgentSessionKey(flowOwnerSessionKey)?.agentId;
+    const globalOwnerAllowed =
+      flowOwnerSessionKey === "global" && params.cfg.session?.scope === "global";
+    if (
+      canonicalFlowOwner !== flowOwnerSessionKey ||
+      flowOwnerSessionKey === "unknown" ||
+      (!globalOwnerAllowed &&
+        (!workerAgentId ||
+          !ownerAgentId ||
+          normalizeAgentId(workerAgentId) !== normalizeAgentId(ownerAgentId) ||
+          isSubagentSessionKey(flowOwnerSessionKey)))
+    ) {
+      throw new Error("managed-flow owner is not a canonical requester session for this agent");
+    }
+    managedFlow = getTaskFlowByIdForOwner({
+      flowId: parentFlowId,
+      callerOwnerKey: flowOwnerSessionKey,
+    });
+    if (
+      !managedFlow ||
+      managedFlow.syncMode !== "managed" ||
+      managedFlow.controllerId !== "workboard" ||
+      (managedFlow.status !== "queued" && managedFlow.status !== "running") ||
+      managedFlow.cancelRequestedAt != null
+    ) {
+      throw new Error("managed-flow linkage does not identify an active Workboard flow");
+    }
+    const admitted = runTaskInFlowForOwner({
+      flowId: parentFlowId,
+      callerOwnerKey: flowOwnerSessionKey,
+      runtime: "subagent",
+      sourceId: params.runId,
+      childSessionKey,
+      runId: params.runId,
+      label: "plugin:workboard",
+      task: params.task,
+      deliveryStatus: "not_applicable",
+      status: "running",
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+    if (
+      !admitted.created ||
+      !admitted.task ||
+      admitted.task.runId !== params.runId ||
+      admitted.task.childSessionKey !== childSessionKey ||
+      admitted.task.ownerKey !== flowOwnerSessionKey ||
+      admitted.task.parentFlowId !== parentFlowId ||
+      admitted.task.status !== "running"
+    ) {
+      throw new Error(admitted.reason ?? "managed-flow task admission failed");
+    }
+    admittedTaskId = admitted.task.taskId;
+  }
   const { registerSubagentRun } = await import("../../agents/subagent-registry.js");
-  registerSubagentRun({
-    runId: params.runId,
-    childSessionKey,
-    controllerSessionKey: ownerSessionKey,
-    requesterSessionKey: ownerSessionKey,
-    requesterOrigin: params.requesterOrigin,
-    requesterDisplayKey: "main",
-    task: params.task,
-    cleanup: "keep",
-    ...(params.pluginId ? { label: `plugin:${params.pluginId}` } : {}),
-    expectsCompletionMessage: false,
-    spawnMode: "run",
-  });
+  try {
+    const requesterSessionKey = managedFlow?.ownerKey ?? identity.ownerSessionKey;
+    const registered = registerSubagentRun({
+      runId: params.runId,
+      childSessionKey,
+      controllerSessionKey: requesterSessionKey,
+      requesterSessionKey,
+      requesterOrigin: managedFlow?.requesterOrigin ?? params.requesterOrigin,
+      requesterDisplayKey: "main",
+      task: params.task,
+      cleanup: "keep",
+      ...(params.pluginId ? { label: `plugin:${params.pluginId}` } : {}),
+      expectsCompletionMessage: false,
+      spawnMode: "run",
+      workspaceDir: params.workspaceDir,
+      ...(parentFlowId ? { parentFlowId, requireDurableTask: true } : {}),
+    });
+    if (!registered) {
+      if (admittedTaskId) {
+        deleteTaskRecordById(admittedTaskId);
+      }
+      throw new Error("plugin subagent registry rejected the run");
+    }
+  } catch (error) {
+    // The registry manager rolls strict tasks back on persistence failures.
+    // This fallback covers rejection before it assumes ownership.
+    if (admittedTaskId) {
+      deleteTaskRecordById(admittedTaskId);
+    }
+    throw error;
+  }
 }
 
 function resolveFailedTrackedAgentTaskStatus(error: unknown): GatewayAgentTaskTerminalStatus {
@@ -1135,6 +1294,8 @@ export const agentHandlers: GatewayRequestHandlers = {
       replyTo?: string;
       sessionId?: string;
       sessionKey?: string;
+      parentFlowId?: string;
+      flowOwnerSessionKey?: string;
       thinking?: string;
       deliver?: boolean;
       attachments?: Array<{
@@ -1180,11 +1341,54 @@ export const agentHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "cwd must be absolute"));
       return;
     }
-    if (request.cwd && !normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId)) {
+    if (request.cwd) {
+      request.cwd = path.normalize(request.cwd);
+    }
+    const trustedInterruptedResumeCwd =
+      request.inputProvenance?.kind === "inter_session" &&
+      request.inputProvenance.sourceTool === "subagent_interrupted_resume" &&
+      resolveCanUseInternalRuntimeHandoff(client);
+    if (
+      request.cwd &&
+      !normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId) &&
+      !trustedInterruptedResumeCwd
+    ) {
       respond(
         false,
         undefined,
         errorShape(ErrorCodes.INVALID_REQUEST, "cwd is reserved for plugin-owned subagent runs"),
+      );
+      return;
+    }
+    const parentFlowId = normalizeOptionalString(request.parentFlowId);
+    const flowOwnerSessionKey = normalizeOptionalString(request.flowOwnerSessionKey);
+    if (
+      (request.parentFlowId !== undefined && !parentFlowId) ||
+      (request.flowOwnerSessionKey !== undefined && !flowOwnerSessionKey) ||
+      Boolean(parentFlowId) !== Boolean(flowOwnerSessionKey)
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "parentFlowId and flowOwnerSessionKey must be non-empty and provided together",
+        ),
+      );
+      return;
+    }
+    if (
+      parentFlowId &&
+      (client?.internal?.agentRunTracking !== "plugin_subagent" ||
+        normalizeOptionalString(client.internal.pluginRuntimeOwnerId) !== "workboard")
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "managed-flow linkage is reserved for trusted Workboard subagent runs",
+        ),
       );
       return;
     }
@@ -3144,7 +3348,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         inputProvenance,
         confirmedAcpManualSpawn,
       });
-      let dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent"> =
+      const dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent"> =
         taskTrackingMode === "cli" ? "cli" : "none";
       if (taskTrackingMode === "plugin_subagent" && resolvedSessionKey) {
         try {
@@ -3160,14 +3364,28 @@ export const agentHandlers: GatewayRequestHandlers = {
               threadId: resolvedThreadId,
             }),
             pluginId: normalizeOptionalString(client?.internal?.pluginRuntimeOwnerId),
+            parentFlowId,
+            flowOwnerSessionKey,
+            workspaceDir: request.cwd,
           });
         } catch (err) {
           context.logGateway.warn(
-            `failed to register plugin subagent run ${runId}; falling back to cli task tracking: ${formatForLog(
+            `failed to durably register plugin subagent run ${runId}; rejecting before dispatch: ${formatForLog(
               err,
             )}`,
           );
-          dispatchTaskTrackingMode = "cli";
+          cleanupAdmittedRun({ force: true });
+          if (pendingChatRun) {
+            context.removeChatRun(runId, runId, resolvedSessionKey);
+          }
+          clearAgentRunContext(runId, lifecycleGeneration);
+          respond(
+            false,
+            undefined,
+            errorShape(ErrorCodes.UNAVAILABLE, "plugin subagent registration failed"),
+            { runId, error: "plugin subagent registration failed" },
+          );
+          return;
         }
       }
 
@@ -3535,6 +3753,50 @@ export const agentHandlers: GatewayRequestHandlers = {
       return;
     }
 
+    const lifecycleState = inspectAgentJobState(runId);
+    // A current chat/controller or accepted dedupe entry owns this run id even
+    // when a prior generation left a lifecycle terminal in the process cache.
+    const hasCurrentRunState =
+      activeChatEntry !== undefined ||
+      context.dedupe.has(`agent:${runId}`) ||
+      context.dedupe.has(`chat:${runId}`) ||
+      lifecycleState.unsettled;
+    if (lifecycleState.terminal && !hasCurrentRunState) {
+      respond(true, {
+        runId,
+        status: lifecycleState.terminal.status,
+        startedAt: lifecycleState.terminal.startedAt,
+        endedAt: lifecycleState.terminal.endedAt,
+        error: lifecycleState.terminal.error,
+        stopReason: lifecycleState.terminal.stopReason,
+        livenessState: lifecycleState.terminal.livenessState,
+        yielded: lifecycleState.terminal.yielded,
+        pendingError: lifecycleState.terminal.pendingError,
+        timeoutPhase: lifecycleState.terminal.timeoutPhase,
+        providerStarted: lifecycleState.terminal.providerStarted,
+      });
+      return;
+    }
+
+    // Gateway lifecycle and dedupe snapshots are intentionally process-local.
+    // After a restart, recover terminal plugin-subagent results from the durable
+    // task registry so callers do not mistake a known failure for a live timeout.
+    // Never consult older durable state while this lifecycle owns the run id.
+    const durableTaskSnapshot = hasCurrentRunState
+      ? null
+      : readTerminalSnapshotFromDurableSubagentTask(runId);
+    if (durableTaskSnapshot) {
+      respond(true, {
+        runId,
+        status: durableTaskSnapshot.status,
+        startedAt: durableTaskSnapshot.startedAt,
+        endedAt: durableTaskSnapshot.endedAt,
+        error: durableTaskSnapshot.error,
+        stopReason: durableTaskSnapshot.stopReason,
+      });
+      return;
+    }
+
     const lifecycleAbortController = new AbortController();
     const dedupeAbortController = new AbortController();
     const dedupePromise = waitForTerminalGatewayDedupe({
@@ -3576,6 +3838,7 @@ export const agentHandlers: GatewayRequestHandlers = {
       runId,
       timeoutMs,
       signal: lifecycleAbortController.signal,
+      ignoreCachedSnapshot: hasCurrentRunState,
     });
 
     const first = await Promise.race([

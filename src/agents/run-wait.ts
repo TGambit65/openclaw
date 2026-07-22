@@ -23,6 +23,7 @@ import {
   normalizeProviderStarted,
   type AgentRunTimeoutPhase,
 } from "./run-timeout-attribution.js";
+import { isRestartInterruptedAgentError } from "./subagent-restart-interruption.js";
 import { extractAssistantText, stripToolMessages } from "./tools/chat-history-text.js";
 
 type GatewayCaller = typeof callGateway;
@@ -144,6 +145,9 @@ export function isRecoverableAgentWaitError(error: string | undefined): boolean 
   }
   if (message.includes("gateway timeout")) {
     return false;
+  }
+  if (isRestartInterruptedAgentError(message)) {
+    return true;
   }
   return RECOVERABLE_AGENT_WAIT_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }

@@ -45,6 +45,7 @@ import {
   markTaskRunningByRunId,
   markTaskTerminalById,
   recordTaskProgressByRunId,
+  reconcileTaskWithVerifiedWorkboardCompletion,
   reloadTaskRegistryFromStore,
   resetTaskRegistryControlRuntimeForTests,
   resetTaskRegistryDeliveryRuntimeForTests,
@@ -807,6 +808,109 @@ describe("task-registry", () => {
         status: "timed_out",
         endedAt: 200,
       });
+    });
+  });
+
+  it("corrects only the exact stale Workboard failure owned by an earlier verified intent", async () => {
+    await withTaskRegistryTempDir(async () => {
+      resetTaskRegistryMemoryForTest();
+      resetTaskFlowRegistryForTests({ persist: false });
+      const ownerKey = "agent:main:telegram:direct:verified-task-correction";
+      const childSessionKey = "agent:main:subagent:verified-task-correction";
+      const runId = "run-verified-task-correction";
+      const flow = createManagedTaskFlow({
+        ownerKey,
+        controllerId: "workboard",
+        goal: "Correct an intent-owned lifecycle failure",
+        status: "blocked",
+        notifyPolicy: "silent",
+        blockedSummary: "Waiting for the Workboard worker.",
+      });
+      const task = createTaskRecord({
+        runtime: "subagent",
+        ownerKey,
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "Finish after verified completion",
+        status: "running",
+        deliveryStatus: "not_applicable",
+      });
+      finalizeTaskRunByRunId({
+        runId,
+        runtime: "subagent",
+        sessionKey: childSessionKey,
+        status: "failed",
+        endedAt: 200,
+        error: "Agent run failed",
+      });
+
+      expect(
+        finalizeTaskRunByRunId({
+          runId,
+          runtime: "subagent",
+          sessionKey: childSessionKey,
+          status: "succeeded",
+          endedAt: 210,
+          terminalSummary: "verified result",
+        }),
+      ).toHaveLength(0);
+      expect(
+        reconcileTaskWithVerifiedWorkboardCompletion({
+          taskId: task.taskId,
+          runId,
+          sessionKey: childSessionKey,
+          flowId: "wrong-flow",
+          acceptedAt: 190,
+          endedAt: 210,
+          completionText: "verified result",
+        }),
+      ).toBeNull();
+      expect(
+        reconcileTaskWithVerifiedWorkboardCompletion({
+          taskId: task.taskId,
+          runId,
+          sessionKey: childSessionKey,
+          flowId: flow.flowId,
+          acceptedAt: 201,
+          endedAt: 210,
+          completionText: "verified result",
+        }),
+      ).toBeNull();
+      expect(requireTaskByRunId(runId)).toMatchObject({
+        status: "failed",
+        error: "Agent run failed",
+      });
+
+      const correction = {
+        taskId: task.taskId,
+        runId,
+        sessionKey: childSessionKey,
+        flowId: flow.flowId,
+        acceptedAt: 190,
+        endedAt: 210,
+        completionText: "verified result",
+      };
+      const corrected = reconcileTaskWithVerifiedWorkboardCompletion(correction);
+      expect(corrected).toMatchObject({
+        status: "succeeded",
+        terminalSummary: "verified result",
+        terminalOutcome: "succeeded",
+      });
+      expect(corrected?.error).toBeUndefined();
+      expect(reconcileTaskWithVerifiedWorkboardCompletion(correction)).toMatchObject({
+        status: "succeeded",
+        terminalSummary: "verified result",
+      });
+      expect(
+        reconcileTaskWithVerifiedWorkboardCompletion({
+          ...correction,
+          completionText: "conflicting result",
+        }),
+      ).toBeNull();
+      expect(requireTaskByRunId(runId).terminalSummary).toBe("verified result");
     });
   });
 

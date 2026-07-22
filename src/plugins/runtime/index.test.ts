@@ -51,7 +51,11 @@ function createCommandResult() {
 function createGatewaySubagentRuntime() {
   return {
     run: vi.fn(),
+    resolveOwnerSession: vi.fn(),
     waitForRun: vi.fn(),
+    getRecoveryOwnership: vi.fn(),
+    getRunState: vi.fn(),
+    requireCompletionDelivery: vi.fn(),
     getSessionMessages: vi.fn(),
     getSession: vi.fn(),
     deleteSession: vi.fn(),

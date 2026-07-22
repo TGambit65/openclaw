@@ -239,6 +239,8 @@ export async function executePluginCommand(params: {
   gatewayClientScopes?: PluginCommandContext["gatewayClientScopes"];
   /** Host-resolved agent authority for plugin-owned or non-agent-shaped session keys. */
   agentId?: string;
+  /** Host-resolved workspace for the active session. */
+  workspaceDir?: string;
   sessionKey?: PluginCommandContext["sessionKey"];
   sessionId?: PluginCommandContext["sessionId"];
   sessionFile?: PluginCommandContext["sessionFile"];
@@ -348,6 +350,7 @@ export async function executePluginCommand(params: {
     ...(senderIsOwnerForCommand === undefined ? {} : { senderIsOwner: senderIsOwnerForCommand }),
     gatewayClientScopes: params.gatewayClientScopes,
     agentId: params.agentId,
+    workspaceDir: params.workspaceDir,
     sessionKey: params.sessionKey,
     sessionId: params.sessionId,
     sessionFile: params.sessionFile,

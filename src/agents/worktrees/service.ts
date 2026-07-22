@@ -461,16 +461,20 @@ export class ManagedWorktreeService {
 
   async acquire(id: string): Promise<ManagedWorktreeRecord> {
     const record = this.requireLiveRecord(id);
-    const result = await runGit(record.repoRoot, [
-      "worktree",
-      "lock",
-      "--reason",
-      `openclaw pid=${process.pid}`,
-      record.path,
-    ]);
+    const lockArgs = ["worktree", "lock", "--reason", `openclaw pid=${process.pid}`, record.path];
+    let result = await runGit(record.repoRoot, lockArgs);
     if (result.code !== 0) {
       const state = await lockState(record);
-      if (state.kind !== "live" || state.pid !== process.pid) {
+      if (state.kind === "dead") {
+        // A forced gateway restart cannot run release(). Only an OpenClaw lock
+        // with a provably dead PID is safe to take over; live and foreign
+        // owners remain protected below.
+        await requireGit(record.repoRoot, ["worktree", "unlock", record.path]);
+        result = await runGit(record.repoRoot, lockArgs);
+      }
+      const afterRetry =
+        result.code === 0 ? { kind: "live", pid: process.pid } : await lockState(record);
+      if (result.code !== 0 && (afterRetry.kind !== "live" || afterRetry.pid !== process.pid)) {
         throw commandError("git worktree lock", result);
       }
     }
@@ -616,10 +620,13 @@ export class ManagedWorktreeService {
 
   async removeIfLosslessByPath(worktreePath: string): Promise<boolean> {
     const record = findLiveRegistryWorktreeByPath(this.env, worktreePath);
-    if (!record) {
-      return false;
+    if (record) {
+      return await this.removeIfLossless(record.id);
     }
-    return await this.removeIfLossless(record.id);
+    // A successful removal is recorded durably before this method returns.
+    // Treat that retained tombstone as success so callers can safely retry
+    // after crashing before their own cleanup acknowledgement is persisted.
+    return findRegistryWorktreeByPath(this.env, worktreePath)?.removedAt !== undefined;
   }
 
   async releaseByPath(worktreePath: string): Promise<void> {

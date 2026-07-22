@@ -9,6 +9,8 @@ import type { SubagentLifecycleEndedReason } from "./subagent-lifecycle-events.j
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
 export type PendingFinalDeliveryPayload = {
+  /** Durable caller obligation that froze this exact completion payload. */
+  obligationId?: string;
   requesterSessionKey: string;
   requesterOrigin?: DeliveryContext;
   requesterDisplayKey: string;
@@ -44,6 +46,53 @@ export type SubagentCompletionState = {
   fallbackCapturedAt?: number;
 };
 
+export type WorkboardVerifiedCompletionProof = {
+  id: string;
+  status: "passed";
+  createdAt: number;
+  label?: string;
+  command?: string;
+  url?: string;
+  note?: string;
+};
+
+export type WorkboardVerifiedCompletionArtifact = {
+  id: string;
+  createdAt: number;
+  path: string;
+  byteSize: number;
+  sha256: string;
+  verifiedAt: number;
+  label?: string;
+  url?: string;
+  mimeType?: string;
+};
+
+/** Immutable, core-owned delivery obligation accepted from the trusted Workboard plugin. */
+export type WorkboardVerifiedCompletionIntent = {
+  kind: "verified_workboard_completion";
+  obligationId: string;
+  payloadHash: string;
+  acceptedAt: number;
+  cardId: string;
+  childSessionKey: string;
+  runId: string;
+  expectedRunId: string;
+  expectedRevision: string;
+  claimOwnerId: string;
+  summary: string;
+  completionText: string;
+  proof: WorkboardVerifiedCompletionProof;
+  artifacts: WorkboardVerifiedCompletionArtifact[];
+  createdCardIds: string[];
+  flowId: string;
+  flowOwnerSessionKey: string;
+  requesterSessionKey: string;
+  requesterOrigin?: DeliveryContext;
+  flowRevision: number;
+  controllerId: "workboard";
+};
+
 export type SubagentCompletionDeliveryState = {
   status:
     | "not_required"
@@ -53,6 +102,10 @@ export type SubagentCompletionDeliveryState = {
     | "failed"
     | "suspended"
     | "discarded";
+  /** Idempotency key supplied by the trusted completion owner. */
+  obligationId?: string;
+  /** Frozen structured payload whose delivery must survive process restarts. */
+  verifiedWorkboardCompletion?: WorkboardVerifiedCompletionIntent;
   payload?: PendingFinalDeliveryPayload;
   createdAt?: number;
   enqueuedAt?: number;
@@ -93,10 +146,110 @@ type SubagentKillReconciliationState = {
   supersededAt?: number;
 };
 
+export type SubagentTaskGenerationRecoveryState = {
+  /** Successor run that still needs its own durable task row. */
+  runId: string;
+  requestedAt: number;
+  lastAttemptAt: number;
+  attemptCount: number;
+  lastError?: string;
+};
+
+export type SubagentOrphanRecoveryState = {
+  /** Core-owned durable handshake state for one exact predecessor generation. */
+  status: "core_owned" | "successor" | "exhausted" | "declined";
+  /** Immediate run generation that was interrupted. */
+  predecessorRunId: string;
+  /** First Workboard run in a restart chain, allowing R1 to resolve directly to R3. */
+  rootRunId: string;
+  /** Preallocated Gateway run id and idempotency key, or the accepted successor id. */
+  successorRunId?: string;
+  claimedAt: number;
+  updatedAt: number;
+  settledAt?: number;
+  error?: string;
+};
+
+export type SubagentRecoveryOwnershipQuery = {
+  childSessionKey: string;
+  predecessorRunId: string;
+};
+
+export type SubagentRecoveryOwnershipResult =
+  | { status: "unknown" }
+  | { status: "core_owned"; successorRunId?: string }
+  | { status: "successor"; successorRunId: string }
+  | { status: "exhausted"; error?: string };
+
+/** Exact, Workboard-only existence query for ambiguous subagent.run responses. */
+export type WorkboardSubagentRunStateQuery = {
+  childSessionKey: string;
+  runId: string;
+};
+
+export type WorkboardCompletionDeliveryView = {
+  deliveryStatus?: SubagentCompletionDeliveryState["status"];
+  deliveredAt?: number;
+  deliveryError?: string;
+  discardReason?: SubagentCompletionDeliveryState["discardReason"];
+  deliveryObligationId?: string;
+  verifiedCompletionIntent?: WorkboardVerifiedCompletionIntent;
+};
+
+export type WorkboardSubagentRunStateResult = (
+  | { status: "unknown" }
+  | { status: "absent" }
+  | { status: "active" }
+  | {
+      status: "terminal";
+      outcome?: "ok" | "error" | "timeout" | "killed";
+      error?: string;
+    }
+) &
+  WorkboardCompletionDeliveryView;
+
+export type WorkboardCompletionDeliveryRequirement = {
+  childSessionKey: string;
+  runId: string;
+  obligationId: string;
+  cardId: string;
+  expectedRunId: string;
+  expectedRevision: string;
+  claimOwnerId: string;
+  summary: string;
+  completionText: string;
+  proof: WorkboardVerifiedCompletionProof;
+  artifacts: WorkboardVerifiedCompletionArtifact[];
+  createdCardIds: string[];
+  flowId: string;
+  flowOwnerSessionKey: string;
+  flowRevision: number;
+  controllerId: "workboard";
+};
+
+export type WorkboardCompletionDeliveryRequirementResult =
+  | {
+      status: "armed" | "already_armed" | "delivered";
+      deliveryStatus: SubagentCompletionDeliveryState["status"];
+      deliveredAt?: number;
+      verifiedCompletionIntent: WorkboardVerifiedCompletionIntent;
+    }
+  | { status: "unknown"; error?: string };
+
+export type SubagentOrphanRecoveryClaimResult =
+  | { status: "claimed"; successorRunId: string }
+  | { status: "successor"; successorRunId: string }
+  | { status: "exhausted" }
+  | { status: "unavailable"; error: string };
+
 export type SubagentRunRecord = {
   runId: string;
   /** Detached task owner; steer/restart changes runId but continues the same task. */
   taskRunId?: string;
+  /** Durable repair marker when an accepted restart successor lacks its new task row. */
+  taskGenerationRecovery?: SubagentTaskGenerationRecoveryState;
+  /** Durable ownership handshake for core-vs-plugin restart recovery. */
+  orphanRecovery?: SubagentOrphanRecoveryState;
   childSessionKey: string;
   controllerSessionKey?: string;
   requesterSessionKey: string;

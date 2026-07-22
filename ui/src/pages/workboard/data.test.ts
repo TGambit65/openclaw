@@ -1400,7 +1400,9 @@ describe("workboard controller", () => {
     expect(state.dispatching).toBe(false);
     expect(state.lifecycleTaskRefreshFailed).toBe(false);
     expect(state.lifecycleTaskRefreshError).toBeNull();
-    expect(client.request).toHaveBeenCalledWith("workboard.cards.dispatch", {});
+    expect(client.request).toHaveBeenCalledWith("workboard.cards.dispatch", {
+      ownerMode: "canonical_main_no_origin",
+    });
   });
 
   it("clears stale refresh errors after a successful dispatch reload", async () => {
@@ -1452,7 +1454,9 @@ describe("workboard controller", () => {
     await Promise.resolve();
     await dispatchWorkboard({ host, client: client as never });
 
-    expect(client.request).not.toHaveBeenCalledWith("workboard.cards.dispatch", {});
+    expect(client.request).not.toHaveBeenCalledWith("workboard.cards.dispatch", {
+      ownerMode: "canonical_main_no_origin",
+    });
 
     update.resolve({ card: sampleCard });
     await save;
@@ -1512,7 +1516,9 @@ describe("workboard controller", () => {
     expect(getWorkboardState(host).busyCardIds).toEqual(new Set([secondCard.id]));
     expect(getWorkboardState(host).draggedCardId).toBe(secondCard.id);
     await dispatchWorkboard({ host, client: client as never });
-    expect(client.request).not.toHaveBeenCalledWith("workboard.cards.dispatch", {});
+    expect(client.request).not.toHaveBeenCalledWith("workboard.cards.dispatch", {
+      ownerMode: "canonical_main_no_origin",
+    });
 
     second.resolve({ card: { ...secondCard, status: "review" } });
     await secondMove;
@@ -2151,7 +2157,9 @@ describe("workboard controller", () => {
 
     const dispatch = dispatchWorkboard({ host, client: client as never });
     await vi.waitFor(() => {
-      expect(client.request).toHaveBeenCalledWith("workboard.cards.dispatch", {});
+      expect(client.request).toHaveBeenCalledWith("workboard.cards.dispatch", {
+        ownerMode: "canonical_main_no_origin",
+      });
     });
     stopWorkboardLifecycleRefresh(host);
     dispatchResult.resolve({});

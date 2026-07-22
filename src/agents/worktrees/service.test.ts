@@ -127,6 +127,35 @@ describe("ManagedWorktreeService", () => {
     expect(await fs.readFile(path.join(restored.path, "README.md"), "utf8")).toBe("base\n");
   });
 
+  it("reacquires a managed worktree after the prior OpenClaw owner process died", async () => {
+    const created = await service.create({
+      repoRoot: repo,
+      name: "restart-reacquire",
+      ownerKind: "workboard",
+      ownerId: "card-restart",
+    });
+    await git(repo, "worktree", "lock", "--reason", "openclaw pid=999999", created.path);
+
+    await expect(service.acquire(created.id)).resolves.toMatchObject({ id: created.id });
+
+    const porcelain = await git(repo, "worktree", "list", "--porcelain");
+    expect(porcelain).toContain(`locked openclaw pid=${process.pid}`);
+    expect(porcelain).not.toContain("locked openclaw pid=999999");
+  });
+
+  it("does not take over a foreign worktree lock while reacquiring", async () => {
+    const created = await service.create({
+      repoRoot: repo,
+      name: "foreign-reacquire",
+      ownerKind: "workboard",
+      ownerId: "card-foreign",
+    });
+    await git(repo, "worktree", "lock", "--reason", "other-tool", created.path);
+
+    await expect(service.acquire(created.id)).rejects.toThrow("already locked");
+    expect(await git(repo, "worktree", "list", "--porcelain")).toContain("locked other-tool");
+  });
+
   it("retries worktree add from local HEAD when the resolved remote base is stale", async () => {
     await addRemote(root, repo);
     const blob = await git(repo, "rev-parse", "HEAD:README.md");
@@ -349,6 +378,16 @@ describe("ManagedWorktreeService", () => {
     await git(committed.path, "add", "commit.txt");
     await git(committed.path, "commit", "-m", "unpushed");
     expect(await service.removeIfLossless(committed.id)).toBe(false);
+  });
+
+  it("treats repeated lossless removal by path as idempotent", async () => {
+    await addRemote(root, repo);
+    const created = await service.create({ repoRoot: repo, name: "idempotent-cleanup" });
+    await service.acquire(created.id);
+
+    await expect(service.removeIfLosslessByPath(created.path)).resolves.toBe(true);
+    await expect(service.removeIfLosslessByPath(created.path)).resolves.toBe(true);
+    expect(getRegistryWorktree(env, created.id)?.removedAt).toBe(now);
   });
 
   it("exempts manual worktrees and garbage collects idle run-owned worktrees", async () => {

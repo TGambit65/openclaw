@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_RUN_RESTART_ABORT_STOP_REASON } from "../../agents/run-termination.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
-import { waitForAgentJob } from "./agent-job.js";
+import { inspectAgentJobState, waitForAgentJob } from "./agent-job.js";
 
 const HARD_TIMEOUT_PHASES = ["preflight", "provider", "post_turn"] as const;
 const NON_HARD_TIMEOUTS = [
@@ -125,6 +125,39 @@ describe("waitForAgentJob timeout fallback", () => {
       status: "timeout",
       timeoutPhase: "provider",
       endedAt: 1_100,
+    });
+  });
+
+  it("reports lifecycle starts and terminal retry grace as unsettled", async () => {
+    const runId = `run-inspection-${runSequence++}`;
+    emitAgentEvent({
+      runId,
+      stream: "lifecycle",
+      data: { phase: "start", startedAt: 1_000 },
+    });
+    expect(inspectAgentJobState(runId)).toEqual({ terminal: null, unsettled: true });
+
+    emitAgentEvent({
+      runId,
+      stream: "lifecycle",
+      data: {
+        phase: "error",
+        startedAt: 1_000,
+        endedAt: 1_100,
+        error: "gateway closed (1012): service restart",
+      },
+    });
+    expect(inspectAgentJobState(runId)).toEqual({ terminal: null, unsettled: true });
+
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(inspectAgentJobState(runId)).toMatchObject({
+      terminal: {
+        status: "error",
+        startedAt: 1_000,
+        endedAt: 1_100,
+        error: "gateway closed (1012): service restart",
+      },
+      unsettled: false,
     });
   });
 });

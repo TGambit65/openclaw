@@ -41,6 +41,41 @@ describe("normalizeSubagentRunState", () => {
     expect(nonString.taskRunId).toBeUndefined();
   });
 
+  it("preserves only a valid restart-safe task generation repair marker", () => {
+    const valid = normalizeSubagentRunState(
+      baseRun({
+        taskRunId: "old-task-run",
+        taskGenerationRecovery: {
+          runId: " run-1 ",
+          requestedAt: 110,
+          lastAttemptAt: 120,
+          attemptCount: 2,
+          lastError: " temporary failure ",
+        },
+      }),
+    );
+    const mismatched = normalizeSubagentRunState(
+      baseRun({
+        taskGenerationRecovery: {
+          runId: "another-run",
+          requestedAt: 110,
+          lastAttemptAt: 120,
+          attemptCount: 2,
+        },
+      }),
+    );
+
+    expect(valid.taskRunId).toBe("old-task-run");
+    expect(valid.taskGenerationRecovery).toEqual({
+      runId: "run-1",
+      requestedAt: 110,
+      lastAttemptAt: 120,
+      attemptCount: 2,
+      lastError: "temporary failure",
+    });
+    expect(mismatched.taskGenerationRecovery).toBeUndefined();
+  });
+
   it("normalizes the durable delete-dispatch boundary", () => {
     const valid = normalizeSubagentRunState(baseRun({ deleteCleanupDispatchedAt: 200 }));
     const malformed = normalizeSubagentRunState(baseRun({ deleteCleanupDispatchedAt: Number.NaN }));

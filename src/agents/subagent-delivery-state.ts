@@ -50,6 +50,85 @@ export function normalizeSubagentRunState(entry: SubagentRunRecord): SubagentRun
   const legacy = entry as LegacySubagentRunRecord;
   const taskRunId = typeof entry.taskRunId === "string" ? entry.taskRunId.trim() : "";
   entry.taskRunId = taskRunId || undefined;
+  const taskGenerationRecovery = entry.taskGenerationRecovery;
+  if (
+    !taskGenerationRecovery ||
+    typeof taskGenerationRecovery !== "object" ||
+    typeof taskGenerationRecovery.runId !== "string" ||
+    !taskGenerationRecovery.runId.trim() ||
+    taskGenerationRecovery.runId.trim() !== entry.runId.trim()
+  ) {
+    entry.taskGenerationRecovery = undefined;
+  } else {
+    entry.taskGenerationRecovery = {
+      runId: taskGenerationRecovery.runId.trim(),
+      requestedAt: Number.isFinite(taskGenerationRecovery.requestedAt)
+        ? taskGenerationRecovery.requestedAt
+        : entry.createdAt,
+      lastAttemptAt: Number.isFinite(taskGenerationRecovery.lastAttemptAt)
+        ? taskGenerationRecovery.lastAttemptAt
+        : entry.createdAt,
+      attemptCount:
+        Number.isSafeInteger(taskGenerationRecovery.attemptCount) &&
+        taskGenerationRecovery.attemptCount > 0
+          ? taskGenerationRecovery.attemptCount
+          : 1,
+      lastError:
+        typeof taskGenerationRecovery.lastError === "string" &&
+        taskGenerationRecovery.lastError.trim()
+          ? taskGenerationRecovery.lastError.trim()
+          : undefined,
+    };
+  }
+  const orphanRecovery = entry.orphanRecovery;
+  const orphanRecoveryStatus = orphanRecovery?.status;
+  const orphanPredecessorRunId =
+    typeof orphanRecovery?.predecessorRunId === "string"
+      ? orphanRecovery.predecessorRunId.trim()
+      : "";
+  const orphanRootRunId =
+    typeof orphanRecovery?.rootRunId === "string" ? orphanRecovery.rootRunId.trim() : "";
+  const orphanSuccessorRunId =
+    typeof orphanRecovery?.successorRunId === "string" ? orphanRecovery.successorRunId.trim() : "";
+  const validOrphanStatus =
+    orphanRecoveryStatus === "core_owned" ||
+    orphanRecoveryStatus === "successor" ||
+    orphanRecoveryStatus === "exhausted" ||
+    orphanRecoveryStatus === "declined";
+  const orphanStateOwnsCurrentRow =
+    orphanRecoveryStatus === "successor"
+      ? orphanSuccessorRunId === entry.runId.trim()
+      : orphanPredecessorRunId === entry.runId.trim();
+  if (
+    !orphanRecovery ||
+    typeof orphanRecovery !== "object" ||
+    !validOrphanStatus ||
+    !orphanPredecessorRunId ||
+    !orphanRootRunId ||
+    !orphanStateOwnsCurrentRow ||
+    ((orphanRecoveryStatus === "core_owned" || orphanRecoveryStatus === "successor") &&
+      !orphanSuccessorRunId)
+  ) {
+    entry.orphanRecovery = undefined;
+  } else {
+    entry.orphanRecovery = {
+      status: orphanRecoveryStatus,
+      predecessorRunId: orphanPredecessorRunId,
+      rootRunId: orphanRootRunId,
+      successorRunId: orphanSuccessorRunId,
+      claimedAt: Number.isFinite(orphanRecovery.claimedAt)
+        ? orphanRecovery.claimedAt
+        : entry.createdAt,
+      updatedAt: Number.isFinite(orphanRecovery.updatedAt)
+        ? orphanRecovery.updatedAt
+        : entry.createdAt,
+      settledAt: Number.isFinite(orphanRecovery.settledAt) ? orphanRecovery.settledAt : undefined,
+      error:
+        typeof orphanRecovery.error === "string" && orphanRecovery.error.trim()
+          ? orphanRecovery.error.trim()
+          : undefined,
+    };
+  }
   entry.generation =
     typeof entry.generation === "number" &&
     Number.isSafeInteger(entry.generation) &&

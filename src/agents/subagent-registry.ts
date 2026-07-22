@@ -3,6 +3,8 @@
  *
  * Owns registration, lifecycle, delivery retry, steering, orphan recovery, persistence, and cleanup for child runs.
  */
+import { createHash, randomUUID } from "node:crypto";
+import { isAbsolute as isAbsolutePath } from "node:path";
 import type { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -10,6 +12,7 @@ import type { ResolveContextEngineOptions } from "../context-engine/registry.js"
 import type { ContextEngine, SubagentEndReason } from "../context-engine/types.js";
 import { callGateway } from "../gateway/call.js";
 import { getAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   formatAbandonedLivenessError,
@@ -20,10 +23,18 @@ import {
 import { createLazyImportLoader, createLazyPromiseLoader } from "../shared/lazy-promise.js";
 import { importRuntimeModule } from "../shared/runtime-import.js";
 import { SUBAGENT_KILL_TASK_ERROR } from "../tasks/detached-task-runtime-contract.js";
-import { finalizeTaskRunByRunId, findDetachedTaskRun } from "../tasks/detached-task-runtime.js";
+import {
+  finalizeTaskRunByRunId,
+  findDetachedTaskRun,
+  findDetachedTaskRunStrict,
+  reconcileVerifiedWorkboardCompletion,
+} from "../tasks/detached-task-runtime.js";
 import { isProvisionalSubagentKillTask } from "../tasks/task-cancellation-state.js";
+import { getTaskFlowByIdForOwner } from "../tasks/task-flow-owner-access.js";
+import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
-import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
+import { listTasksForSessionKeyForStatusStrict } from "../tasks/task-status-access.js";
+import { deliveryContextKey, normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import {
   ackLeasedAgentSteeringItemsFromSubagentRuns,
@@ -34,7 +45,7 @@ import {
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
 import { isAbortedAgentStopReason } from "./run-termination.js";
 import type { ensureRuntimePluginsLoaded as ensureRuntimePluginsLoadedFn } from "./runtime-plugins.js";
-import type { SubagentRunOutcome } from "./subagent-announce-output.js";
+import { type SubagentRunOutcome, withSubagentOutcomeTiming } from "./subagent-announce-output.js";
 import {
   ensureCompletionState,
   ensureDeliveryState,
@@ -56,6 +67,7 @@ import {
 } from "./subagent-registry-completion.js";
 import {
   ANNOUNCE_EXPIRY_MS,
+  capFrozenResultText,
   MAX_ANNOUNCE_RETRY_COUNT,
   PROVISIONAL_KILL_RECONCILIATION_MS,
   reconcileOrphanedRestoredRuns,
@@ -86,12 +98,26 @@ import {
 import {
   clearSubagentRunsReadCacheForTest,
   getSubagentRunsSnapshotForRead,
+  getSubagentRunsSnapshotForReadStrict,
   persistSubagentRunsToDisk,
   persistSubagentRunsToDiskOrThrow,
   restoreSubagentRunsFromDisk,
 } from "./subagent-registry-state.js";
 import { configureSubagentRegistrySteerRuntime } from "./subagent-registry-steer-runtime.js";
-import type { SubagentRunRecord } from "./subagent-registry.types.js";
+import type {
+  SubagentOrphanRecoveryClaimResult,
+  SubagentRecoveryOwnershipQuery,
+  SubagentRecoveryOwnershipResult,
+  SubagentRunRecord,
+  WorkboardCompletionDeliveryRequirement,
+  WorkboardCompletionDeliveryRequirementResult,
+  WorkboardSubagentRunStateQuery,
+  WorkboardSubagentRunStateResult,
+  WorkboardVerifiedCompletionArtifact,
+  WorkboardVerifiedCompletionIntent,
+  WorkboardVerifiedCompletionProof,
+} from "./subagent-registry.types.js";
+import { isRestartInterruptedAgentError } from "./subagent-restart-interruption.js";
 import { compareSubagentRunGeneration } from "./subagent-run-generation.js";
 import {
   resolveSubagentRunDeadlineMs,
@@ -105,9 +131,23 @@ import {
   resolveSubagentSessionStartedAt,
   type SubagentSessionStoreCache,
 } from "./subagent-session-reconciliation.js";
+import {
+  resolveOwnedSubagentTaskRunId,
+  resolveSubagentTaskGenerationRetryDelayMs,
+  tryCreateRecoveredSubagentTaskGeneration,
+} from "./subagent-task-generation.js";
 import { resolveAgentTimeoutMs } from "./timeout.js";
 
-export type { SubagentRunRecord } from "./subagent-registry.types.js";
+export type {
+  SubagentRecoveryOwnershipQuery,
+  SubagentRecoveryOwnershipResult,
+  SubagentRunRecord,
+  WorkboardCompletionDeliveryRequirement,
+  WorkboardCompletionDeliveryRequirementResult,
+  WorkboardSubagentRunStateQuery,
+  WorkboardSubagentRunStateResult,
+  WorkboardVerifiedCompletionIntent,
+} from "./subagent-registry.types.js";
 export {
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
@@ -123,12 +163,17 @@ type BrowserCleanupModule = Pick<
   typeof import("../browser-lifecycle-cleanup.js"),
   "cleanupBrowserSessionsForLifecycleEnd"
 >;
+type SubagentOrphanRecoveryModule = Pick<
+  typeof import("./subagent-orphan-recovery.js"),
+  "scheduleOrphanRecovery"
+>;
 
 type SubagentRegistryDeps = {
   callGateway: typeof callGateway;
   captureSubagentCompletionReply: SubagentAnnounceModule["captureSubagentCompletionReply"];
   cleanupBrowserSessionsForLifecycleEnd: typeof cleanupBrowserSessionsForLifecycleEnd;
   getSubagentRunsSnapshotForRead: typeof getSubagentRunsSnapshotForRead;
+  getSubagentRunsSnapshotForReadStrict: typeof getSubagentRunsSnapshotForReadStrict;
   getRuntimeConfig: typeof getRuntimeConfig;
   onAgentEvent: typeof onAgentEvent;
   persistSubagentRunsToDisk: typeof persistSubagentRunsToDisk;
@@ -136,6 +181,7 @@ type SubagentRegistryDeps = {
   resolveAgentTimeoutMs: typeof resolveAgentTimeoutMs;
   restoreSubagentRunsFromDisk: typeof restoreSubagentRunsFromDisk;
   runSubagentAnnounceFlow: SubagentAnnounceModule["runSubagentAnnounceFlow"];
+  loadOrphanRecoveryModule: () => Promise<SubagentOrphanRecoveryModule>;
   ensureContextEnginesInitialized?: () => void;
   ensureRuntimePluginsLoaded?: (
     params: Parameters<typeof ensureRuntimePluginsLoadedFn>[0],
@@ -170,6 +216,7 @@ const defaultSubagentRegistryDeps: SubagentRegistryDeps = {
   cleanupBrowserSessionsForLifecycleEnd: async (params) =>
     (await loadCleanupBrowserSessionsForLifecycleEnd())(params),
   getSubagentRunsSnapshotForRead,
+  getSubagentRunsSnapshotForReadStrict,
   getRuntimeConfig,
   onAgentEvent,
   persistSubagentRunsToDisk,
@@ -178,6 +225,7 @@ const defaultSubagentRegistryDeps: SubagentRegistryDeps = {
   restoreSubagentRunsFromDisk,
   runSubagentAnnounceFlow: async (params) =>
     (await loadSubagentAnnounceModule()).runSubagentAnnounceFlow(params),
+  loadOrphanRecoveryModule: async () => await import("./subagent-orphan-recovery.js"),
 };
 
 let subagentRegistryDeps: SubagentRegistryDeps = defaultSubagentRegistryDeps;
@@ -299,15 +347,466 @@ function persistSubagentRunsOrThrow() {
   subagentRegistryDeps.persistSubagentRunsToDiskOrThrow(subagentRuns);
 }
 
-function findSubagentTaskForRun(entry: SubagentRunRecord) {
+function findLatestSubagentRunForSession(
+  runs: Iterable<SubagentRunRecord>,
+  childSessionKey: string,
+): SubagentRunRecord | undefined {
+  let latest: SubagentRunRecord | undefined;
+  for (const candidate of runs) {
+    if (candidate.childSessionKey !== childSessionKey) {
+      continue;
+    }
+    if (!latest || compareSubagentRunGeneration(candidate, latest) > 0) {
+      latest = candidate;
+    }
+  }
+  return latest;
+}
+
+function normalizeOrphanRecoveryError(error: string | undefined): string | undefined {
+  const normalized = error?.replace(/\s+/gu, " ").trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.length > 1_000 ? `${normalized.slice(0, 1_000)}…` : normalized;
+}
+
+function normalizeRequiredWorkboardString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized && normalized.length <= maxLength ? normalized : undefined;
+}
+
+function normalizeOptionalWorkboardString(value: unknown, maxLength: number): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return normalizeRequiredWorkboardString(value, maxLength);
+}
+
+function normalizeVerifiedWorkboardProof(
+  proof: WorkboardCompletionDeliveryRequirement["proof"],
+): WorkboardVerifiedCompletionProof | undefined {
+  const id = normalizeRequiredWorkboardString(proof?.id, 512);
+  if (
+    !id ||
+    proof?.status !== "passed" ||
+    !Number.isFinite(proof.createdAt) ||
+    proof.createdAt < 0
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    status: "passed",
+    createdAt: proof.createdAt,
+    ...(normalizeOptionalWorkboardString(proof.label, 160)
+      ? { label: normalizeOptionalWorkboardString(proof.label, 160) }
+      : {}),
+    ...(normalizeOptionalWorkboardString(proof.command, 1_000)
+      ? { command: normalizeOptionalWorkboardString(proof.command, 1_000) }
+      : {}),
+    ...(normalizeOptionalWorkboardString(proof.url, 2_000)
+      ? { url: normalizeOptionalWorkboardString(proof.url, 2_000) }
+      : {}),
+    ...(normalizeOptionalWorkboardString(proof.note, 2_000)
+      ? { note: normalizeOptionalWorkboardString(proof.note, 2_000) }
+      : {}),
+  };
+}
+
+function normalizeVerifiedWorkboardArtifact(
+  artifact: WorkboardCompletionDeliveryRequirement["artifacts"][number],
+): WorkboardVerifiedCompletionArtifact | undefined {
+  const id = normalizeRequiredWorkboardString(artifact?.id, 512);
+  const artifactPath = normalizeRequiredWorkboardString(artifact?.path, 2_000);
+  const sha256 = normalizeRequiredWorkboardString(artifact?.sha256, 64)?.toLowerCase();
+  if (
+    !id ||
+    !artifactPath ||
+    !isAbsolutePath(artifactPath) ||
+    !sha256 ||
+    !/^[a-f0-9]{64}$/u.test(sha256) ||
+    !Number.isSafeInteger(artifact.byteSize) ||
+    artifact.byteSize < 0 ||
+    !Number.isFinite(artifact.createdAt) ||
+    artifact.createdAt < 0 ||
+    !Number.isFinite(artifact.verifiedAt) ||
+    artifact.verifiedAt < 0
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    createdAt: artifact.createdAt,
+    path: artifactPath,
+    byteSize: artifact.byteSize,
+    sha256,
+    verifiedAt: artifact.verifiedAt,
+    ...(normalizeOptionalWorkboardString(artifact.label, 160)
+      ? { label: normalizeOptionalWorkboardString(artifact.label, 160) }
+      : {}),
+    ...(normalizeOptionalWorkboardString(artifact.url, 2_000)
+      ? { url: normalizeOptionalWorkboardString(artifact.url, 2_000) }
+      : {}),
+    ...(normalizeOptionalWorkboardString(artifact.mimeType, 160)
+      ? { mimeType: normalizeOptionalWorkboardString(artifact.mimeType, 160) }
+      : {}),
+  };
+}
+
+type WorkboardVerifiedCompletionPayload = Omit<
+  WorkboardVerifiedCompletionIntent,
+  "acceptedAt" | "payloadHash"
+>;
+
+type WorkboardVerifiedCompletionInputPayload = Omit<
+  WorkboardVerifiedCompletionPayload,
+  "requesterSessionKey" | "requesterOrigin"
+>;
+
+function normalizeVerifiedWorkboardRequesterOrigin(
+  value: DeliveryContext | undefined,
+): DeliveryContext | undefined {
+  const normalized = normalizeDeliveryContext(value);
+  if (!normalized) {
+    return undefined;
+  }
+  return {
+    ...(normalized.channel ? { channel: normalized.channel } : {}),
+    ...(normalized.to ? { to: normalized.to } : {}),
+    ...(normalized.accountId ? { accountId: normalized.accountId } : {}),
+    ...(normalized.threadId !== undefined ? { threadId: normalized.threadId } : {}),
+  };
+}
+
+function normalizeVerifiedWorkboardCompletionPayload(
+  requirement: WorkboardCompletionDeliveryRequirement,
+): WorkboardVerifiedCompletionInputPayload | undefined {
+  const childSessionKey = normalizeRequiredWorkboardString(requirement.childSessionKey, 1_000);
+  const runId = normalizeRequiredWorkboardString(requirement.runId, 512);
+  const expectedRunId = normalizeRequiredWorkboardString(requirement.expectedRunId, 512);
+  const obligationId = normalizeRequiredWorkboardString(requirement.obligationId, 1_000);
+  const cardId = normalizeRequiredWorkboardString(requirement.cardId, 512);
+  const expectedRevision = normalizeRequiredWorkboardString(requirement.expectedRevision, 512);
+  const claimOwnerId = normalizeRequiredWorkboardString(requirement.claimOwnerId, 512);
+  const summary = normalizeRequiredWorkboardString(requirement.summary, 2_000);
+  const rawCompletionText = normalizeRequiredWorkboardString(
+    requirement.completionText,
+    1024 * 1024,
+  );
+  const flowId = normalizeRequiredWorkboardString(requirement.flowId, 512);
+  const flowOwnerSessionKey = normalizeRequiredWorkboardString(
+    requirement.flowOwnerSessionKey,
+    1_000,
+  );
+  const proof = normalizeVerifiedWorkboardProof(requirement.proof);
+  const artifacts = Array.isArray(requirement.artifacts)
+    ? requirement.artifacts.map(normalizeVerifiedWorkboardArtifact)
+    : [];
+  const createdCardIds = Array.isArray(requirement.createdCardIds)
+    ? [
+        ...new Set(
+          requirement.createdCardIds.map((id) => normalizeRequiredWorkboardString(id, 512)),
+        ),
+      ]
+    : [];
+  if (
+    !childSessionKey ||
+    !runId ||
+    !expectedRunId ||
+    expectedRunId !== runId ||
+    !obligationId ||
+    !cardId ||
+    !expectedRevision ||
+    !claimOwnerId ||
+    !summary ||
+    !rawCompletionText ||
+    !flowId ||
+    !flowOwnerSessionKey ||
+    requirement.controllerId !== "workboard" ||
+    !Number.isSafeInteger(requirement.flowRevision) ||
+    requirement.flowRevision < 0 ||
+    !proof ||
+    artifacts.length === 0 ||
+    artifacts.length > 32 ||
+    artifacts.some((artifact) => artifact === undefined) ||
+    createdCardIds.length > 120 ||
+    createdCardIds.some((id) => id === undefined)
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "verified_workboard_completion",
+    obligationId,
+    cardId,
+    childSessionKey,
+    runId,
+    expectedRunId,
+    expectedRevision,
+    claimOwnerId,
+    summary,
+    completionText: capFrozenResultText(rawCompletionText),
+    proof,
+    artifacts: artifacts as WorkboardVerifiedCompletionArtifact[],
+    createdCardIds: createdCardIds as string[],
+    flowId,
+    flowOwnerSessionKey,
+    flowRevision: requirement.flowRevision,
+    controllerId: "workboard",
+  };
+}
+
+function hashVerifiedWorkboardCompletionPayload(
+  payload: WorkboardVerifiedCompletionPayload,
+): string {
+  // Revisions are optimistic-concurrency hints, not obligation identity. Normal
+  // Workboard heartbeat/log and flow transitions can advance them between a
+  // committed delivery request, a lost response, and its idempotent retry.
+  const {
+    expectedRevision: _expectedRevision,
+    flowRevision: _flowRevision,
+    ...immutablePayload
+  } = payload;
+  return createHash("sha256").update(JSON.stringify(immutablePayload)).digest("hex");
+}
+
+export function claimSubagentOrphanRecovery(params: {
+  predecessorRunId: string;
+  childSessionKey: string;
+  successorRunId: string;
+  claimedAt?: number;
+}): SubagentOrphanRecoveryClaimResult {
+  const predecessorRunId = params.predecessorRunId.trim();
+  const childSessionKey = params.childSessionKey.trim();
+  const proposedSuccessorRunId = params.successorRunId.trim();
+  if (!predecessorRunId || !childSessionKey || !proposedSuccessorRunId) {
+    return { status: "unavailable", error: "invalid recovery ownership key" };
+  }
+  const entry = subagentRuns.get(predecessorRunId);
+  if (
+    !entry ||
+    entry.childSessionKey !== childSessionKey ||
+    entry.delivery?.verifiedWorkboardCompletion !== undefined ||
+    findLatestSubagentRunForSession(subagentRuns.values(), childSessionKey) !== entry
+  ) {
+    return { status: "unavailable", error: "recovery predecessor is not the latest run" };
+  }
+  const current = entry.orphanRecovery;
+  if (
+    current?.status === "core_owned" &&
+    current.predecessorRunId === predecessorRunId &&
+    current.successorRunId
+  ) {
+    return { status: "claimed", successorRunId: current.successorRunId };
+  }
+  if (
+    current?.status === "successor" &&
+    current.successorRunId === entry.runId &&
+    predecessorRunId !== entry.runId
+  ) {
+    return { status: "successor", successorRunId: current.successorRunId };
+  }
+  if (
+    (current?.status === "exhausted" || current?.status === "declined") &&
+    current.predecessorRunId === predecessorRunId
+  ) {
+    return { status: "exhausted" };
+  }
+
+  const now = params.claimedAt ?? Date.now();
+  const previous = entry.orphanRecovery;
+  entry.orphanRecovery = {
+    status: "core_owned",
+    predecessorRunId,
+    rootRunId: previous?.rootRunId?.trim() || predecessorRunId,
+    successorRunId: proposedSuccessorRunId,
+    claimedAt: now,
+    updatedAt: now,
+  };
+  try {
+    persistSubagentRunsOrThrow();
+  } catch (error) {
+    entry.orphanRecovery = previous;
+    return {
+      status: "unavailable",
+      error: `failed to persist recovery ownership: ${formatErrorMessage(error)}`,
+    };
+  }
+  return { status: "claimed", successorRunId: proposedSuccessorRunId };
+}
+
+function settleSubagentOrphanRecovery(params: {
+  predecessorRunId: string;
+  childSessionKey: string;
+  status: "exhausted" | "declined";
+  error?: string;
+  settledAt?: number;
+}): boolean {
+  const predecessorRunId = params.predecessorRunId.trim();
+  const childSessionKey = params.childSessionKey.trim();
+  const entry = subagentRuns.get(predecessorRunId);
+  if (!entry || entry.childSessionKey !== childSessionKey) {
+    return false;
+  }
+  const current = entry.orphanRecovery;
+  if (
+    !current ||
+    current.status !== "core_owned" ||
+    current.predecessorRunId !== predecessorRunId
+  ) {
+    return current?.status === params.status;
+  }
+  const settledAt = params.settledAt ?? Date.now();
+  entry.orphanRecovery = {
+    ...current,
+    status: params.status,
+    updatedAt: settledAt,
+    settledAt,
+    error: normalizeOrphanRecoveryError(params.error),
+  };
+  try {
+    persistSubagentRunsOrThrow();
+  } catch {
+    entry.orphanRecovery = current;
+    return false;
+  }
+  return true;
+}
+
+export function markSubagentOrphanRecoveryExhausted(params: {
+  predecessorRunId: string;
+  childSessionKey: string;
+  error?: string;
+  settledAt?: number;
+}): boolean {
+  return settleSubagentOrphanRecovery({ ...params, status: "exhausted" });
+}
+
+export function markSubagentOrphanRecoveryDeclined(params: {
+  predecessorRunId: string;
+  childSessionKey: string;
+  error?: string;
+  settledAt?: number;
+}): boolean {
+  return settleSubagentOrphanRecovery({ ...params, status: "declined" });
+}
+
+function findSubagentTaskForRunId(params: {
+  entry: SubagentRunRecord;
+  runId: string;
+  allowSessionFallback: boolean;
+}) {
+  const { entry } = params;
   const nextRunCreatedAt = findNextSubagentRunCreatedAt(entry);
   const generationStartedAt = entry.sessionStartedAt ?? entry.createdAt;
   return findDetachedTaskRun({
-    runId: entry.taskRunId ?? entry.runId,
+    runId: params.runId,
     runtime: "subagent",
     sessionKey: entry.childSessionKey,
     createdAtOrAfter: generationStartedAt,
     createdBefore: nextRunCreatedAt,
+    allowSessionFallback: params.allowSessionFallback,
+  });
+}
+
+function persistPendingTaskGenerationLink(entry: SubagentRunRecord, taskRunId: string): boolean {
+  const previousTaskRunId = entry.taskRunId;
+  const previousRecovery = entry.taskGenerationRecovery;
+  entry.taskRunId = taskRunId;
+  entry.taskGenerationRecovery = undefined;
+  try {
+    persistSubagentRunsOrThrow();
+    return true;
+  } catch (error) {
+    entry.taskRunId = previousTaskRunId;
+    entry.taskGenerationRecovery = previousRecovery;
+    log.warn("failed to persist repaired subagent task generation link", {
+      error,
+      runId: entry.runId,
+      childSessionKey: entry.childSessionKey,
+      taskRunId,
+    });
+    return false;
+  }
+}
+
+function recordPendingTaskGenerationFailure(entry: SubagentRunRecord, error: string): void {
+  const recovery = entry.taskGenerationRecovery;
+  if (!recovery) {
+    return;
+  }
+  const now = Date.now();
+  entry.taskGenerationRecovery = {
+    ...recovery,
+    lastAttemptAt: now,
+    attemptCount: Math.min(recovery.attemptCount + 1, Number.MAX_SAFE_INTEGER),
+    lastError: error,
+  };
+  try {
+    persistSubagentRuns();
+  } catch (persistError) {
+    log.warn("failed to persist pending subagent task generation retry", {
+      error: persistError,
+      runId: entry.runId,
+      childSessionKey: entry.childSessionKey,
+    });
+  }
+}
+
+function repairPendingSubagentTaskGeneration(entry: SubagentRunRecord) {
+  const recovery = entry.taskGenerationRecovery;
+  if (!recovery) {
+    return undefined;
+  }
+  const expectedTask = findSubagentTaskForRunId({
+    entry,
+    runId: recovery.runId,
+    allowSessionFallback: false,
+  });
+  if (expectedTask.lookup === "available" && expectedTask.task) {
+    persistPendingTaskGenerationLink(entry, recovery.runId);
+    return expectedTask;
+  }
+
+  const now = Date.now();
+  const retryDelayMs = resolveSubagentTaskGenerationRetryDelayMs(recovery.attemptCount);
+  if (now < recovery.lastAttemptAt + retryDelayMs) {
+    return expectedTask;
+  }
+
+  const previousTask = entry.taskRunId
+    ? findSubagentTaskForRunId({
+        entry,
+        runId: entry.taskRunId,
+        allowSessionFallback: false,
+      }).task
+    : undefined;
+  const creation = tryCreateRecoveredSubagentTaskGeneration({
+    entry,
+    runId: recovery.runId,
+    task: entry.task,
+    startedAt: entry.startedAt ?? entry.createdAt,
+    previousTask,
+  });
+  if (creation.task) {
+    persistPendingTaskGenerationLink(entry, recovery.runId);
+    return { lookup: "available" as const, task: creation.task };
+  }
+  recordPendingTaskGenerationFailure(entry, creation.error);
+  return expectedTask;
+}
+
+function findSubagentTaskForRun(entry: SubagentRunRecord) {
+  const repairedTask = repairPendingSubagentTaskGeneration(entry);
+  if (repairedTask) {
+    return repairedTask;
+  }
+  return findSubagentTaskForRunId({
+    entry,
+    runId: entry.taskRunId ?? entry.runId,
     // Steer/wake replaces the registry run ID while retaining the original
     // task row. Only those continuations may adopt a session-scoped task.
     allowSessionFallback:
@@ -315,6 +814,17 @@ function findSubagentTaskForRun(entry: SubagentRunRecord) {
       typeof entry.sessionStartedAt === "number" &&
       entry.sessionStartedAt < entry.createdAt,
   });
+}
+
+function hasRestartInterruptedRunEvidence(entry: SubagentRunRecord): boolean {
+  const executionOutcome = entry.execution?.outcome;
+  const executionError =
+    executionOutcome?.status === "error" ? (executionOutcome.error?.trim() ?? "") : "";
+  if (isRestartInterruptedAgentError(executionError)) {
+    return true;
+  }
+  const task = findSubagentTaskForRun(entry).task;
+  return task?.status === "failed" && isRestartInterruptedAgentError(task.error);
 }
 
 function findNextSubagentRunCreatedAt(entry: SubagentRunRecord): number | undefined {
@@ -371,13 +881,83 @@ function resolveCompletionFromTerminalTask(
   };
 }
 
+function preclaimCurrentSubagentOrphanRecoveries(): Array<{
+  predecessorRunId: string;
+  childSessionKey: string;
+}> {
+  const latestBySession = new Map<string, SubagentRunRecord>();
+  for (const candidate of subagentRuns.values()) {
+    const childSessionKey = candidate.childSessionKey.trim();
+    if (!childSessionKey) {
+      continue;
+    }
+    const latest = latestBySession.get(childSessionKey);
+    if (!latest || compareSubagentRunGeneration(candidate, latest) > 0) {
+      latestBySession.set(childSessionKey, candidate);
+    }
+  }
+  const claims: Array<{ predecessorRunId: string; childSessionKey: string }> = [];
+  const cfg = subagentRegistryDeps.getRuntimeConfig();
+  const storeCache: SubagentSessionStoreCache = new Map();
+  for (const candidate of latestBySession.values()) {
+    const alreadyOwned =
+      candidate.orphanRecovery?.status === "core_owned" &&
+      candidate.orphanRecovery.predecessorRunId === candidate.runId;
+    let abortedByRestart = false;
+    try {
+      const sessionEntry = loadSubagentSessionEntry({
+        childSessionKey: candidate.childSessionKey,
+        cfg,
+        storeCache,
+      });
+      const runStartedAt = candidate.startedAt ?? candidate.createdAt;
+      abortedByRestart =
+        sessionEntry?.abortedLastRun === true &&
+        (!Number.isFinite(sessionEntry.updatedAt) ||
+          !Number.isFinite(runStartedAt) ||
+          sessionEntry.updatedAt >= runStartedAt);
+    } catch {
+      // Retain an existing durable claim below; otherwise the recovery module
+      // will retry candidate discovery once session state is readable.
+    }
+    const interruptedExecution =
+      candidate.execution?.status === "interrupted" &&
+      (candidate.execution.interruptionReason === "gateway-restart" ||
+        candidate.execution.interruptionReason === "lost-execution-context");
+    if (
+      !alreadyOwned &&
+      !abortedByRestart &&
+      !interruptedExecution &&
+      !hasRestartInterruptedRunEvidence(candidate)
+    ) {
+      continue;
+    }
+    const claimed = claimSubagentOrphanRecovery({
+      predecessorRunId: candidate.runId,
+      childSessionKey: candidate.childSessionKey,
+      successorRunId: randomUUID(),
+    });
+    if (claimed.status === "claimed") {
+      claims.push({
+        predecessorRunId: candidate.runId,
+        childSessionKey: candidate.childSessionKey,
+      });
+    }
+  }
+  return claims;
+}
+
 export function scheduleSubagentOrphanRecovery(params?: { delayMs?: number; maxRetries?: number }) {
+  // The loader itself can fail during a cold boot. Persist ownership first so
+  // that such a failure has an exact state to exhaust instead of silently
+  // abandoning an unowned interrupted run.
+  const preclaimed = preclaimCurrentSubagentOrphanRecoveries();
   const now = Date.now();
   if (now - lastOrphanRecoveryScheduleAt < ORPHAN_RECOVERY_DEBOUNCE_MS) {
     return;
   }
   lastOrphanRecoveryScheduleAt = now;
-  void import("./subagent-orphan-recovery.js").then(
+  void subagentRegistryDeps.loadOrphanRecoveryModule().then(
     ({ scheduleOrphanRecovery }) => {
       scheduleOrphanRecovery({
         getActiveRuns: () => subagentRuns,
@@ -385,8 +965,22 @@ export function scheduleSubagentOrphanRecovery(params?: { delayMs?: number; maxR
         maxRetries: params?.maxRetries,
       });
     },
-    () => {
-      // Ignore import failures — orphan recovery is best-effort.
+    (error: unknown) => {
+      const failure = `orphan recovery module unavailable: ${formatErrorMessage(error)}`;
+      for (const claim of preclaimed) {
+        if (
+          markSubagentOrphanRecoveryExhausted({
+            ...claim,
+            error: failure,
+          })
+        ) {
+          void finalizeInterruptedSubagentRun({
+            runId: claim.predecessorRunId,
+            childSessionKey: claim.childSessionKey,
+            error: failure,
+          });
+        }
+      }
     },
   );
 }
@@ -729,7 +1323,11 @@ function resumeSubagentRun(runId: string) {
     return;
   }
   if (typeof entry.endedAt === "number" && isDeliverySuspended(entry)) {
-    return;
+    if (!entry.delivery?.verifiedWorkboardCompletion) {
+      return;
+    }
+    rearmSuspendedVerifiedWorkboardDelivery(entry);
+    persistSubagentRuns();
   }
   // Yielded runs stay paused until explicitly steered, except orchestrators
   // waiting on descendants: their settle retry must reach the wake path.
@@ -849,6 +1447,16 @@ function restoreSubagentRunsOnce() {
     // Always start sweeper — session-mode runs (no archiveAtMs) also need TTL cleanup.
     startSweeper();
     for (const runId of subagentRuns.keys()) {
+      const restored = subagentRuns.get(runId);
+      if (restored?.delivery?.verifiedWorkboardCompletion) {
+        if (
+          typeof restored.endedAt !== "number" &&
+          getAgentRunContext(restored.runId)?.sessionKey !== restored.childSessionKey
+        ) {
+          finalizeVerifiedWorkboardCompletionState(restored);
+        }
+        reconcileVerifiedWorkboardTaskProjection(restored);
+      }
       resumeSubagentRun(runId);
     }
 
@@ -1028,6 +1636,12 @@ async function sweepSubagentRuns() {
       });
     }
     for (const [runId, entry] of subagentRuns.entries()) {
+      // Replacement starts this sweeper, and cold-start restore restarts it.
+      // Retry a missing successor task row even while the Gateway run remains
+      // active; the repair helper enforces its own capped backoff.
+      if (entry.taskGenerationRecovery) {
+        findSubagentTaskForRun(entry);
+      }
       if (isSuspendedPendingFinalDelivery(entry)) {
         const suspendedAgeMs = now - (entry.delivery?.suspendedAt ?? now);
         const expired = suspendedAgeMs >= resolveSuspendedDeliveryExpiryMs(entry);
@@ -1069,9 +1683,13 @@ async function sweepSubagentRuns() {
             childSessionKey: entry.childSessionKey,
             storeCache,
           });
-          const completion = resolveCompletionFromSessionEntry(sessionEntry, now, {
-            notBeforeMs: entry.startedAt ?? entry.createdAt,
-          });
+          const failedSessionHasRestartEvidence =
+            sessionEntry?.status === "failed" && hasRestartInterruptedRunEvidence(entry);
+          const completion = failedSessionHasRestartEvidence
+            ? null
+            : resolveCompletionFromSessionEntry(sessionEntry, now, {
+                notBeforeMs: entry.startedAt ?? entry.createdAt,
+              });
           if (completion) {
             await completeSubagentRunWithRecovery(
               {
@@ -1090,6 +1708,22 @@ async function sweepSubagentRuns() {
           }
 
           if (sessionEntry?.abortedLastRun === true) {
+            scheduleSubagentOrphanRecovery({ delayMs: 1_000 });
+            continue;
+          }
+
+          const sessionCanResume =
+            sessionEntry?.status === "running" || failedSessionHasRestartEvidence;
+          if (sessionCanResume) {
+            entry.execution = {
+              ...entry.execution,
+              status: "interrupted",
+              interruptedAt: now,
+              interruptionReason: "lost-execution-context",
+              endedAt: undefined,
+              outcome: undefined,
+            };
+            mutated = true;
             scheduleSubagentOrphanRecovery({ delayMs: 1_000 });
             continue;
           }
@@ -1263,7 +1897,7 @@ async function sweepSubagentRuns() {
             // The live callback may be lost across restart. Make the provisional
             // task state stable before its last reconciliation record is deleted.
             const finalizedTasks = finalizeTaskRunByRunId({
-              runId: taskBefore?.runId ?? entry.taskRunId ?? runId,
+              runId: taskBefore?.runId ?? resolveOwnedSubagentTaskRunId(entry),
               runtime: "subagent",
               sessionKey: taskBefore?.childSessionKey ?? entry.childSessionKey,
               status: "cancelled",
@@ -1580,6 +2214,9 @@ const subagentRunManager = createSubagentRunManager({
 configureSubagentRegistrySteerRuntime({
   replaceSubagentRunAfterSteer: (params) => subagentRunManager.replaceSubagentRunAfterSteer(params),
   finalizeInterruptedSubagentRun: async (params) => await finalizeInterruptedSubagentRun(params),
+  claimSubagentOrphanRecovery,
+  markSubagentOrphanRecoveryDeclined,
+  markSubagentOrphanRecoveryExhausted,
 });
 
 export function markSubagentRunForSteerRestart(runId: string) {
@@ -1596,6 +2233,9 @@ export function replaceSubagentRunAfterSteer(params: {
   fallback?: SubagentRunRecord;
   runTimeoutSeconds?: number;
   preserveFrozenResultFallback?: boolean;
+  requireDurableReplacement?: boolean;
+  createFreshTaskGeneration?: boolean;
+  taskGenerationAlreadyCreated?: boolean;
   transcriptFile?: string;
   task?: string;
 }) {
@@ -1603,7 +2243,7 @@ export function replaceSubagentRunAfterSteer(params: {
 }
 
 export function registerSubagentRun(params: RegisterSubagentRunParams) {
-  subagentRunManager.registerSubagentRun(params);
+  return subagentRunManager.registerSubagentRun(params);
 }
 
 export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
@@ -1626,6 +2266,7 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
   stopSweeper();
   sweepInProgress = false;
   restoreAttempted = false;
+  lastOrphanRecoveryScheduleAt = 0;
   if (listenerStop) {
     listenerStop();
     listenerStop = null;
@@ -1642,6 +2283,9 @@ export const testing = {
   },
   async runSweeperTickForTests() {
     await runSubagentSweep();
+  },
+  async refreshFrozenResultFromSessionForTests(sessionKey: string) {
+    return await refreshFrozenResultFromSession(sessionKey);
   },
   setDepsForTest(overrides?: Partial<SubagentRegistryDeps>) {
     subagentRegistryDeps = overrides
@@ -1729,6 +2373,813 @@ export function resolveRequesterForChildSession(childSessionKey: string): {
     requesterSessionKey: resolved.requesterSessionKey,
     requesterOrigin,
   };
+}
+
+function resolveWorkboardCompletionDeliveryView(
+  entry: SubagentRunRecord | undefined,
+): Pick<
+  WorkboardSubagentRunStateResult,
+  | "deliveryStatus"
+  | "deliveredAt"
+  | "deliveryError"
+  | "discardReason"
+  | "deliveryObligationId"
+  | "verifiedCompletionIntent"
+> {
+  const delivery = entry?.delivery;
+  if (!delivery) {
+    return {};
+  }
+  const intent = delivery.verifiedWorkboardCompletion;
+  return {
+    deliveryStatus: delivery.status,
+    ...(typeof delivery.deliveredAt === "number" ? { deliveredAt: delivery.deliveredAt } : {}),
+    ...(normalizeOrphanRecoveryError(delivery.lastError ?? undefined)
+      ? { deliveryError: normalizeOrphanRecoveryError(delivery.lastError ?? undefined) }
+      : {}),
+    ...(delivery.discardReason ? { discardReason: delivery.discardReason } : {}),
+    ...(delivery.obligationId || intent?.obligationId
+      ? { deliveryObligationId: delivery.obligationId ?? intent?.obligationId }
+      : {}),
+    ...(intent ? { verifiedCompletionIntent: structuredClone(intent) } : {}),
+  };
+}
+
+function buildWorkboardCompletionDeliveryResult(
+  status: "armed" | "already_armed" | "delivered",
+  entry: SubagentRunRecord,
+  intent: WorkboardVerifiedCompletionIntent,
+): WorkboardCompletionDeliveryRequirementResult {
+  const delivery = entry.delivery;
+  return {
+    status,
+    deliveryStatus: delivery?.status ?? "pending",
+    ...(typeof delivery?.deliveredAt === "number" ? { deliveredAt: delivery.deliveredAt } : {}),
+    verifiedCompletionIntent: structuredClone(intent),
+  };
+}
+
+function isExactWorkboardCompletionTaskLink(params: {
+  entry: SubagentRunRecord;
+  task: TaskRecord | undefined;
+  flowId: string;
+  ownerSessionKey: string;
+}): params is typeof params & { task: TaskRecord } {
+  const task = params.task;
+  return Boolean(
+    task &&
+    task.runtime === "subagent" &&
+    task.runId === params.entry.runId &&
+    task.childSessionKey === params.entry.childSessionKey &&
+    task.ownerKey === params.ownerSessionKey &&
+    task.parentFlowId === params.flowId &&
+    task.label?.trim() === "plugin:workboard",
+  );
+}
+
+function resolveActiveWorkboardCompletionLink(
+  entry: SubagentRunRecord,
+  payload: WorkboardVerifiedCompletionInputPayload,
+): { task: TaskRecord; flow: TaskFlowRecord } | undefined {
+  const taskResolution = findSubagentTaskForRun(entry);
+  if (
+    taskResolution.lookup !== "available" ||
+    !isExactWorkboardCompletionTaskLink({
+      entry,
+      task: taskResolution.task,
+      flowId: payload.flowId,
+      ownerSessionKey: payload.flowOwnerSessionKey,
+    })
+  ) {
+    return undefined;
+  }
+  const flow = getTaskFlowByIdForOwner({
+    flowId: payload.flowId,
+    callerOwnerKey: payload.flowOwnerSessionKey,
+  });
+  if (
+    !flow ||
+    flow.syncMode !== "managed" ||
+    flow.controllerId !== "workboard" ||
+    // Workboard records a managed wait with a blocked summary as `blocked`.
+    // The exact task/run wait is still non-terminal and completion-capable.
+    (flow.status !== "queued" &&
+      flow.status !== "running" &&
+      flow.status !== "waiting" &&
+      flow.status !== "blocked") ||
+    flow.cancelRequestedAt != null
+  ) {
+    return undefined;
+  }
+  return { task: taskResolution.task!, flow };
+}
+
+/**
+ * Proves that an interrupted requester still has an exact Workboard-owned
+ * durable completion route. Main-session recovery uses this only to suppress
+ * its generic interruption notice; the Workboard controller remains the sole
+ * owner of eventual success/failure delivery.
+ */
+export function hasDurableWorkboardCompletionOwnerForRequester(
+  requesterSessionKey: string,
+): boolean {
+  const ownerSessionKey = requesterSessionKey.trim();
+  if (!ownerSessionKey) {
+    return false;
+  }
+  restoreSubagentRunsOnce();
+  let snapshot: Map<string, SubagentRunRecord>;
+  try {
+    snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForReadStrict(subagentRuns);
+  } catch {
+    return false;
+  }
+  for (const entry of snapshot.values()) {
+    const controllerSessionKey =
+      entry.controllerSessionKey?.trim() || entry.requesterSessionKey.trim();
+    if (
+      entry.requesterSessionKey !== ownerSessionKey ||
+      controllerSessionKey !== ownerSessionKey ||
+      entry.label?.trim() !== "plugin:workboard" ||
+      entry.cleanup !== "keep" ||
+      findLatestSubagentRunForSession(snapshot.values(), entry.childSessionKey) !== entry
+    ) {
+      continue;
+    }
+    try {
+      const taskResolution = findSubagentTaskForRun(entry);
+      const task = taskResolution.lookup === "available" ? taskResolution.task : undefined;
+      const flowId = task?.parentFlowId?.trim();
+      if (!task || !flowId) {
+        continue;
+      }
+      const flow = getTaskFlowByIdForOwner({
+        flowId,
+        callerOwnerKey: ownerSessionKey,
+      });
+      if (!flow) {
+        continue;
+      }
+      const entryRouteKey = deliveryContextKey(entry.requesterOrigin);
+      const flowRouteKey = deliveryContextKey(flow.requesterOrigin);
+      if (
+        !isExactWorkboardCompletionTaskLink({
+          entry,
+          task,
+          flowId,
+          ownerSessionKey,
+        }) ||
+        flow.syncMode !== "managed" ||
+        flow.controllerId !== "workboard" ||
+        flow.notifyPolicy !== "silent" ||
+        !entryRouteKey ||
+        entryRouteKey !== flowRouteKey
+      ) {
+        continue;
+      }
+      const flowIsNonTerminal =
+        flow.status === "queued" ||
+        flow.status === "running" ||
+        flow.status === "waiting" ||
+        flow.status === "blocked";
+      const activeLatestGeneration =
+        typeof entry.endedAt !== "number" &&
+        entry.execution?.status !== "terminal" &&
+        (task.status === "queued" || task.status === "running") &&
+        flowIsNonTerminal &&
+        flow.cancelRequestedAt == null;
+      if (activeLatestGeneration) {
+        return true;
+      }
+
+      const delivery = entry.delivery;
+      const intent = delivery?.verifiedWorkboardCompletion;
+      const intentRouteKey = deliveryContextKey(intent?.requesterOrigin);
+      const intentCanDeliver =
+        delivery?.status === "pending" ||
+        delivery?.status === "in_progress" ||
+        delivery?.status === "suspended" ||
+        delivery?.status === "delivered";
+      const flowCanProjectIntent =
+        flowIsNonTerminal &&
+        (flow.cancelRequestedAt == null ||
+          (intent !== undefined && intent.acceptedAt <= flow.cancelRequestedAt));
+      if (
+        intent &&
+        intentCanDeliver &&
+        flowCanProjectIntent &&
+        delivery.obligationId === intent.obligationId &&
+        intent.childSessionKey === entry.childSessionKey &&
+        intent.runId === entry.runId &&
+        intent.flowId === flow.flowId &&
+        intent.flowOwnerSessionKey === ownerSessionKey &&
+        intent.requesterSessionKey === ownerSessionKey &&
+        intent.controllerId === "workboard" &&
+        intentRouteKey === entryRouteKey
+      ) {
+        return true;
+      }
+    } catch {
+      // Suppression is fail closed: any ambiguous registry/task/flow read keeps
+      // the ordinary interruption notice eligible.
+    }
+  }
+  return false;
+}
+
+function reconcileVerifiedWorkboardTaskProjection(entry: SubagentRunRecord): boolean {
+  const intent = entry.delivery?.verifiedWorkboardCompletion;
+  if (!intent || typeof entry.endedAt !== "number") {
+    return false;
+  }
+  const taskResolution = findSubagentTaskForRun(entry);
+  if (
+    taskResolution.lookup !== "available" ||
+    !isExactWorkboardCompletionTaskLink({
+      entry,
+      task: taskResolution.task,
+      flowId: intent.flowId,
+      ownerSessionKey: intent.flowOwnerSessionKey,
+    })
+  ) {
+    return false;
+  }
+  const exactTask = taskResolution.task;
+  if (!exactTask) {
+    return false;
+  }
+  if (exactTask.status === "succeeded" && exactTask.terminalSummary === intent.completionText) {
+    return true;
+  }
+  try {
+    const endedAt = entry.endedAt ?? intent.acceptedAt;
+    const updated = reconcileVerifiedWorkboardCompletion({
+      taskId: exactTask.taskId,
+      runId: entry.runId,
+      sessionKey: entry.childSessionKey,
+      flowId: intent.flowId,
+      acceptedAt: intent.acceptedAt,
+      endedAt,
+      completionText: intent.completionText,
+    });
+    return Boolean(
+      updated &&
+      updated.runId === entry.runId &&
+      updated.childSessionKey === entry.childSessionKey &&
+      updated.status === "succeeded" &&
+      updated.terminalSummary === intent.completionText.replace(/\s+/g, " ").trim(),
+    );
+  } catch (error) {
+    log.warn("failed to reconcile verified Workboard task projection", {
+      error: formatErrorMessage(error),
+      runId: entry.runId,
+      childSessionKey: entry.childSessionKey,
+    });
+    return false;
+  }
+}
+
+function finalizeVerifiedWorkboardCompletionState(
+  entry: SubagentRunRecord,
+  endedAt = Date.now(),
+): boolean {
+  const intent = entry.delivery?.verifiedWorkboardCompletion;
+  if (!intent) {
+    return false;
+  }
+  if (
+    typeof entry.endedAt === "number" &&
+    entry.execution?.status === "terminal" &&
+    entry.outcome?.status === "ok"
+  ) {
+    return true;
+  }
+  const snapshot = structuredClone(entry);
+  const outcome = withSubagentOutcomeTiming(
+    { status: "ok" },
+    { startedAt: entry.startedAt, endedAt },
+  );
+  entry.endedAt = endedAt;
+  entry.endedReason = SUBAGENT_ENDED_REASON_COMPLETE;
+  entry.outcome = outcome;
+  entry.execution = {
+    ...entry.execution,
+    status: "terminal",
+    startedAt: entry.startedAt,
+    endedAt,
+    outcome,
+  };
+  entry.completion = {
+    required: true,
+    resultText: intent.completionText,
+    capturedAt: intent.acceptedAt,
+  };
+  entry.pauseReason = undefined;
+  entry.killReconciliation = undefined;
+  entry.cleanupHandled = false;
+  entry.cleanupCompletedAt = undefined;
+  try {
+    persistSubagentRunsOrThrow();
+    return true;
+  } catch (error) {
+    const target = entry as unknown as Record<string, unknown>;
+    for (const key of Object.keys(target)) {
+      delete target[key];
+    }
+    Object.assign(target, snapshot);
+    log.warn("failed to persist verified Workboard execution-end reconciliation", {
+      error: formatErrorMessage(error),
+      runId: entry.runId,
+      childSessionKey: entry.childSessionKey,
+    });
+    return false;
+  }
+}
+
+function rearmSuspendedVerifiedWorkboardDelivery(entry: SubagentRunRecord): boolean {
+  const delivery = entry.delivery;
+  if (!delivery?.verifiedWorkboardCompletion || delivery.status !== "suspended") {
+    return false;
+  }
+  delivery.status = "pending";
+  delivery.suspendedAt = undefined;
+  delivery.suspendedReason = undefined;
+  delivery.lastAttemptAt = undefined;
+  delivery.attemptCount = 0;
+  entry.cleanupHandled = false;
+  entry.cleanupCompletedAt = undefined;
+  resumedRuns.delete(entry.runId);
+  return true;
+}
+
+/**
+ * Atomically accepts a verified Workboard result as the exact run's terminal,
+ * restart-safe completion-delivery obligation.
+ */
+export function requireWorkboardSubagentCompletionDelivery(
+  requirement: WorkboardCompletionDeliveryRequirement,
+): WorkboardCompletionDeliveryRequirementResult {
+  const inputPayload = normalizeVerifiedWorkboardCompletionPayload(requirement);
+  if (!inputPayload) {
+    return { status: "unknown", error: "invalid verified completion obligation" };
+  }
+  restoreSubagentRunsOnce();
+  const entry = subagentRuns.get(inputPayload.runId);
+  const controllerSessionKey =
+    entry?.controllerSessionKey?.trim() || entry?.requesterSessionKey.trim();
+  if (
+    !entry ||
+    entry.childSessionKey !== inputPayload.childSessionKey ||
+    entry.label?.trim() !== "plugin:workboard" ||
+    entry.cleanup !== "keep" ||
+    controllerSessionKey !== inputPayload.flowOwnerSessionKey ||
+    findLatestSubagentRunForSession(subagentRuns.values(), inputPayload.childSessionKey) !== entry
+  ) {
+    return { status: "unknown", error: "verified completion run ownership is unavailable" };
+  }
+  const existingIntent = entry.delivery?.verifiedWorkboardCompletion;
+  const activeLink = existingIntent
+    ? undefined
+    : resolveActiveWorkboardCompletionLink(entry, inputPayload);
+  if (!existingIntent && !activeLink) {
+    return { status: "unknown", error: "verified completion flow linkage is unavailable" };
+  }
+  const requesterSessionKey = existingIntent?.requesterSessionKey ?? activeLink?.flow.ownerKey;
+  const requesterOrigin = existingIntent?.requesterOrigin
+    ? normalizeVerifiedWorkboardRequesterOrigin(existingIntent.requesterOrigin)
+    : normalizeVerifiedWorkboardRequesterOrigin(activeLink?.flow.requesterOrigin);
+  if (!requesterSessionKey) {
+    return { status: "unknown", error: "verified completion requester route is unavailable" };
+  }
+  const payload: WorkboardVerifiedCompletionPayload = {
+    ...inputPayload,
+    requesterSessionKey,
+    ...(requesterOrigin ? { requesterOrigin } : {}),
+  };
+  const entryRequesterOrigin = normalizeVerifiedWorkboardRequesterOrigin(entry.requesterOrigin);
+  if (
+    requesterSessionKey !== inputPayload.flowOwnerSessionKey ||
+    entry.requesterSessionKey !== requesterSessionKey ||
+    JSON.stringify(entryRequesterOrigin ?? {}) !== JSON.stringify(requesterOrigin ?? {})
+  ) {
+    return { status: "unknown", error: "verified completion requester route is unavailable" };
+  }
+  const payloadHash = hashVerifiedWorkboardCompletionPayload(payload);
+  if (existingIntent) {
+    if (
+      existingIntent.obligationId !== payload.obligationId ||
+      existingIntent.payloadHash !== payloadHash
+    ) {
+      return { status: "unknown", error: "verified completion obligation conflicts" };
+    }
+    if (entry.delivery?.status === "suspended") {
+      rearmSuspendedVerifiedWorkboardDelivery(entry);
+      try {
+        persistSubagentRunsOrThrow();
+      } catch {
+        return { status: "unknown", error: "verified completion retry could not be persisted" };
+      }
+    }
+    const executionStillActive =
+      typeof entry.endedAt !== "number" &&
+      getAgentRunContext(entry.runId)?.sessionKey === entry.childSessionKey;
+    if (executionStillActive) {
+      return buildWorkboardCompletionDeliveryResult("already_armed", entry, existingIntent);
+    }
+    if (typeof entry.endedAt !== "number" && !finalizeVerifiedWorkboardCompletionState(entry)) {
+      return { status: "unknown", error: "verified completion execution end is not durable" };
+    }
+    reconcileVerifiedWorkboardTaskProjection(entry);
+    if (
+      entry.delivery?.status === "pending" &&
+      typeof entry.cleanupCompletedAt !== "number" &&
+      entry.cleanupHandled !== true
+    ) {
+      resumedRuns.delete(entry.runId);
+      startSubagentAnnounceCleanupFlow(entry.runId, entry);
+    }
+    return buildWorkboardCompletionDeliveryResult(
+      entry.delivery?.status === "delivered" ? "delivered" : "already_armed",
+      entry,
+      existingIntent,
+    );
+  }
+  if (entry.delivery?.obligationId && entry.delivery.obligationId !== payload.obligationId) {
+    return { status: "unknown", error: "completion delivery is owned by another obligation" };
+  }
+
+  const acceptedAt = Date.now();
+  const intent: WorkboardVerifiedCompletionIntent = {
+    ...payload,
+    payloadHash,
+    acceptedAt,
+  };
+  const snapshot = structuredClone(entry);
+  const activeExecutionContext = getAgentRunContext(entry.runId);
+  const executionStillActive = activeExecutionContext?.sessionKey === entry.childSessionKey;
+  const endedAt = entry.endedAt ?? acceptedAt;
+  const outcome = withSubagentOutcomeTiming(
+    { status: "ok" },
+    { startedAt: entry.startedAt, endedAt },
+  );
+  if (!executionStillActive) {
+    entry.endedAt = endedAt;
+    entry.endedReason = SUBAGENT_ENDED_REASON_COMPLETE;
+    entry.outcome = outcome;
+    entry.execution = {
+      ...entry.execution,
+      status: "terminal",
+      startedAt: entry.startedAt,
+      endedAt,
+      outcome,
+    };
+  }
+  entry.completion = {
+    required: true,
+    resultText: payload.completionText,
+    capturedAt: acceptedAt,
+  };
+  entry.expectsCompletionMessage = true;
+  entry.suppressCompletionDelivery = undefined;
+  entry.suppressAnnounceReason = undefined;
+  entry.pauseReason = undefined;
+  entry.killReconciliation = undefined;
+  entry.cleanupHandled = false;
+  entry.cleanupCompletedAt = undefined;
+  entry.wakeOnDescendantSettle = undefined;
+  if (entry.orphanRecovery) {
+    entry.orphanRecovery = {
+      ...entry.orphanRecovery,
+      status: "declined",
+      predecessorRunId: entry.runId,
+      successorRunId: undefined,
+      updatedAt: acceptedAt,
+      settledAt: acceptedAt,
+      error: "verified completion accepted",
+    };
+  }
+  entry.delivery = {
+    status: "pending",
+    obligationId: payload.obligationId,
+    verifiedWorkboardCompletion: intent,
+    createdAt: acceptedAt,
+    payload: {
+      obligationId: payload.obligationId,
+      requesterSessionKey: payload.requesterSessionKey,
+      requesterOrigin: payload.requesterOrigin,
+      requesterDisplayKey: entry.requesterDisplayKey,
+      childSessionKey: entry.childSessionKey,
+      childRunId: entry.runId,
+      task: entry.task,
+      label: entry.label,
+      startedAt: entry.startedAt,
+      endedAt,
+      outcome,
+      expectsCompletionMessage: true,
+      spawnMode: entry.spawnMode,
+      frozenResultText: payload.completionText,
+    },
+  };
+
+  try {
+    // The registry commit is the arm boundary. A successful response is never
+    // returned until the exact payload is durable and the run is non-resumable.
+    persistSubagentRunsOrThrow();
+  } catch {
+    const target = entry as unknown as Record<string, unknown>;
+    for (const key of Object.keys(target)) {
+      delete target[key];
+    }
+    Object.assign(target, snapshot);
+    return { status: "unknown", error: "verified completion intent could not be persisted" };
+  }
+
+  if (!executionStillActive) {
+    reconcileVerifiedWorkboardTaskProjection(entry);
+    resumedRuns.delete(entry.runId);
+    startSubagentAnnounceCleanupFlow(entry.runId, entry);
+  }
+  return buildWorkboardCompletionDeliveryResult("armed", entry, intent);
+}
+
+function resolveWorkboardTaskTerminalState(task: TaskRecord): WorkboardSubagentRunStateResult {
+  switch (task.status) {
+    case "succeeded":
+      return { status: "terminal", outcome: "ok" };
+    case "timed_out":
+      return {
+        status: "terminal",
+        outcome: "timeout",
+        error: normalizeOrphanRecoveryError(task.error),
+      };
+    case "cancelled":
+      return {
+        status: "terminal",
+        outcome: "killed",
+        error: normalizeOrphanRecoveryError(task.error),
+      };
+    case "failed":
+    case "lost":
+      return {
+        status: "terminal",
+        outcome: "error",
+        error: normalizeOrphanRecoveryError(task.error),
+      };
+    case "queued":
+    case "running":
+      return { status: "active" };
+  }
+  return { status: "unknown" };
+}
+
+function resolveWorkboardRegistryTerminalState(
+  entry: SubagentRunRecord,
+): WorkboardSubagentRunStateResult {
+  if (entry.endedReason === SUBAGENT_ENDED_REASON_KILLED) {
+    return { status: "terminal", outcome: "killed" };
+  }
+  const outcome = entry.outcome ?? entry.execution?.outcome;
+  if (outcome?.status === "ok") {
+    return { status: "terminal", outcome: "ok" };
+  }
+  if (outcome?.status === "timeout") {
+    return { status: "terminal", outcome: "timeout" };
+  }
+  if (outcome?.status === "error") {
+    return {
+      status: "terminal",
+      outcome: "error",
+      error: normalizeOrphanRecoveryError(outcome.error),
+    };
+  }
+  return { status: "terminal" };
+}
+
+/**
+ * Trusted Workboard-only existence check for an exact subagent.run id.
+ *
+ * `absent` is returned only when the detached-task runtime positively supports
+ * exact lookup and reports no row. Lookup failures remain `unknown` so callers
+ * cannot treat infrastructure unavailability as proof that a run never began.
+ */
+export function queryWorkboardSubagentRunState(
+  params: WorkboardSubagentRunStateQuery,
+): WorkboardSubagentRunStateResult {
+  const childSessionKey = params.childSessionKey.trim();
+  const runId = params.runId.trim();
+  if (!childSessionKey || !runId) {
+    return { status: "unknown" };
+  }
+
+  restoreSubagentRunsOnce();
+  let snapshot: Map<string, SubagentRunRecord> | undefined;
+  try {
+    snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForReadStrict(subagentRuns);
+  } catch {
+    // An exact detached-task row can still prove presence below. Absence is not
+    // trustworthy when either durable source is unavailable.
+  }
+
+  const exactRegistryRun = snapshot?.get(runId);
+  const trustedRegistryRun =
+    exactRegistryRun?.childSessionKey === childSessionKey &&
+    exactRegistryRun.label?.trim() === "plugin:workboard"
+      ? exactRegistryRun
+      : undefined;
+  const latest = snapshot
+    ? findLatestSubagentRunForSession(snapshot.values(), childSessionKey)
+    : undefined;
+  const trustedLatest = latest?.label?.trim() === "plugin:workboard" ? latest : undefined;
+  const trustedPendingSuccessor =
+    trustedLatest?.orphanRecovery?.status === "core_owned" &&
+    trustedLatest.orphanRecovery.successorRunId === runId;
+
+  if (exactRegistryRun && !trustedRegistryRun) {
+    return { status: "unknown" };
+  }
+  if (
+    trustedRegistryRun?.orphanRecovery?.status === "core_owned" &&
+    trustedRegistryRun.orphanRecovery.successorRunId !== runId
+  ) {
+    return { status: "unknown" };
+  }
+
+  let durableTaskReadAvailable = false;
+  let latestDurableSubagentTask: TaskRecord | undefined;
+  let exactDurableTaskCount = 0;
+  try {
+    const durableTasks = listTasksForSessionKeyForStatusStrict(childSessionKey).filter(
+      (task) => task.runtime === "subagent" && task.childSessionKey === childSessionKey,
+    );
+    durableTaskReadAvailable = true;
+    latestDurableSubagentTask = durableTasks[0];
+    exactDurableTaskCount = durableTasks.filter((task) => task.runId === runId).length;
+  } catch {
+    // Exact absence and latest-generation claims require both durable sources.
+  }
+
+  let taskLookupAvailable: boolean | undefined;
+  let exactTask: TaskRecord | undefined;
+  try {
+    const resolution = findDetachedTaskRunStrict({
+      runId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      createdAtOrAfter: 0,
+      allowSessionFallback: false,
+    });
+    taskLookupAvailable = resolution.lookup === "available";
+    const candidate = resolution.task;
+    if (
+      candidate?.runId === runId &&
+      candidate.childSessionKey === childSessionKey &&
+      candidate.label?.trim() === "plugin:workboard"
+    ) {
+      exactTask = candidate;
+    } else if (candidate) {
+      // A custom runtime ignored an exact ownership field. Its result cannot
+      // prove either presence or absence for Workboard.
+      taskLookupAvailable = false;
+    }
+  } catch {
+    taskLookupAvailable = false;
+  }
+
+  // An older exact row/task is not current ownership. The only trusted run id
+  // different from the latest row is its explicitly preclaimed successor.
+  if (latest && !trustedLatest) {
+    return { status: "unknown" };
+  }
+  if (trustedRegistryRun?.delivery?.verifiedWorkboardCompletion && trustedLatest?.runId === runId) {
+    const executionStillActive =
+      typeof trustedRegistryRun.endedAt !== "number" &&
+      getAgentRunContext(trustedRegistryRun.runId)?.sessionKey ===
+        trustedRegistryRun.childSessionKey;
+    if (executionStillActive) {
+      return {
+        status: "active",
+        ...resolveWorkboardCompletionDeliveryView(trustedRegistryRun),
+      };
+    }
+    if (
+      typeof trustedRegistryRun.endedAt !== "number" &&
+      !finalizeVerifiedWorkboardCompletionState(trustedRegistryRun)
+    ) {
+      return { status: "unknown" };
+    }
+    reconcileVerifiedWorkboardTaskProjection(trustedRegistryRun);
+    if (rearmSuspendedVerifiedWorkboardDelivery(trustedRegistryRun)) {
+      persistSubagentRuns();
+      startSubagentAnnounceCleanupFlow(trustedRegistryRun.runId, trustedRegistryRun);
+    }
+    return {
+      ...resolveWorkboardRegistryTerminalState(trustedRegistryRun),
+      ...resolveWorkboardCompletionDeliveryView(trustedRegistryRun),
+    };
+  }
+  if (exactTask) {
+    if (
+      !durableTaskReadAvailable ||
+      exactDurableTaskCount > 1 ||
+      (latestDurableSubagentTask &&
+        (latestDurableSubagentTask.label?.trim() !== "plugin:workboard" ||
+          latestDurableSubagentTask.runId !== runId)) ||
+      (!latestDurableSubagentTask && !trustedRegistryRun && !trustedPendingSuccessor)
+    ) {
+      return { status: "unknown" };
+    }
+    if (trustedLatest && trustedLatest.runId !== runId && !trustedPendingSuccessor) {
+      return { status: "unknown" };
+    }
+    return {
+      ...resolveWorkboardTaskTerminalState(exactTask),
+      ...resolveWorkboardCompletionDeliveryView(trustedRegistryRun),
+    };
+  }
+  if (trustedRegistryRun) {
+    if (trustedLatest && trustedLatest.runId !== runId && !trustedPendingSuccessor) {
+      return { status: "unknown" };
+    }
+    const terminal =
+      (typeof trustedRegistryRun.endedAt === "number" && trustedRegistryRun.endedAt > 0) ||
+      trustedRegistryRun.execution?.status === "terminal";
+    return terminal
+      ? {
+          ...resolveWorkboardRegistryTerminalState(trustedRegistryRun),
+          ...resolveWorkboardCompletionDeliveryView(trustedRegistryRun),
+        }
+      : { status: "active", ...resolveWorkboardCompletionDeliveryView(trustedRegistryRun) };
+  }
+
+  const activeContext = getAgentRunContext(runId);
+  if (trustedPendingSuccessor && activeContext?.sessionKey === childSessionKey) {
+    return { status: "active" };
+  }
+  if (activeContext) {
+    // A run context without trusted Workboard lineage must never be exposed to
+    // the plugin, even if its caller-supplied session happens to match.
+    return { status: "unknown" };
+  }
+  if (snapshot && taskLookupAvailable && durableTaskReadAvailable) {
+    return { status: "absent" };
+  }
+  return { status: "unknown" };
+}
+
+/** Trusted, fail-closed recovery ownership view for the Workboard runtime bridge. */
+export function querySubagentRecoveryOwnership(
+  params: SubagentRecoveryOwnershipQuery,
+): SubagentRecoveryOwnershipResult {
+  const childSessionKey = params.childSessionKey.trim();
+  const predecessorRunId = params.predecessorRunId.trim();
+  if (!childSessionKey || !predecessorRunId) {
+    return { status: "unknown" };
+  }
+  restoreSubagentRunsOnce();
+  let runsSnapshot: Map<string, SubagentRunRecord>;
+  try {
+    runsSnapshot = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns);
+  } catch {
+    return { status: "unknown" };
+  }
+  const latest = findLatestSubagentRunForSession(runsSnapshot.values(), childSessionKey);
+  if (!latest || latest.label?.trim() !== "plugin:workboard") {
+    return { status: "unknown" };
+  }
+  const recovery = latest.orphanRecovery;
+  if (
+    !recovery ||
+    (recovery.predecessorRunId !== predecessorRunId && recovery.rootRunId !== predecessorRunId)
+  ) {
+    return { status: "unknown" };
+  }
+  if (
+    recovery.status === "core_owned" &&
+    recovery.predecessorRunId === latest.runId &&
+    recovery.successorRunId
+  ) {
+    return { status: "core_owned", successorRunId: recovery.successorRunId };
+  }
+  if (
+    recovery.status === "successor" &&
+    recovery.successorRunId === latest.runId &&
+    latest.runId !== predecessorRunId
+  ) {
+    return { status: "successor", successorRunId: latest.runId };
+  }
+  if (
+    (recovery.status === "exhausted" || recovery.status === "declined") &&
+    recovery.predecessorRunId === latest.runId
+  ) {
+    return {
+      status: "exhausted",
+      error:
+        recovery.status === "declined"
+          ? "automatic subagent recovery declined"
+          : "automatic subagent recovery exhausted",
+    };
+  }
+  return { status: "unknown" };
 }
 
 export function isSubagentSessionRunActive(childSessionKey: string): boolean {

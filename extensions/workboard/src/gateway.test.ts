@@ -22,6 +22,66 @@ function createMemoryStore<T = PersistedWorkboardCard>(): WorkboardKeyedStore<T>
   };
 }
 
+function createManagedFlowRuntime() {
+  const flows = new Map<string, Record<string, unknown>>();
+  const bindSession = vi.fn(
+    ({ sessionKey, requesterOrigin }: { sessionKey: string; requesterOrigin?: unknown }) => ({
+      sessionKey,
+      list: vi.fn(() => [...flows.values()]),
+      get: vi.fn((flowId: string) => flows.get(flowId)),
+      createManaged: vi.fn((input: Record<string, unknown>) => {
+        const flowId = `flow-${flows.size + 1}`;
+        const flow = {
+          ...input,
+          flowId,
+          syncMode: "managed",
+          ownerKey: sessionKey,
+          requesterOrigin,
+          revision: 1,
+        };
+        flows.set(flowId, flow);
+        return flow;
+      }),
+      resume: vi.fn((input: { flowId: string }) => {
+        const current = flows.get(input.flowId)!;
+        const flow = { ...current, status: "running", revision: Number(current.revision) + 1 };
+        flows.set(input.flowId, flow);
+        return { applied: true, flow };
+      }),
+      setWaiting: vi.fn(
+        (input: {
+          flowId: string;
+          currentStep?: string;
+          stateJson?: unknown;
+          waitJson?: unknown;
+        }) => {
+          const current = flows.get(input.flowId)!;
+          const flow = {
+            ...current,
+            status: "waiting",
+            revision: Number(current.revision) + 1,
+            currentStep: input.currentStep,
+            stateJson: input.stateJson,
+            waitJson: input.waitJson,
+          };
+          flows.set(input.flowId, flow);
+          return { applied: true, flow };
+        },
+      ),
+    }),
+  );
+  return {
+    bindSession,
+    managedFlows: { bindSession },
+    resolveOwnerSession: vi.fn(async ({ sessionKey }: { sessionKey: string }) => ({
+      status: "resolved" as const,
+      workerSessionKey: sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`,
+      ownerSessionKey: "agent:main:main",
+      workspaceDir: "/tmp/canonical-worker-workspace",
+    })),
+  };
+}
+
 describe("workboard gateway methods", () => {
   it("registers CRUD methods with read/write scopes", async () => {
     type RegisteredMethod = {
@@ -123,6 +183,39 @@ describe("workboard gateway methods", () => {
       respond: createRespond,
     } as never);
     expect(createRespond.mock.calls[0]?.[0]).toBe(true);
+    const cardId = createRespond.mock.calls[0]?.[1]?.card.id;
+
+    for (const [method, requestParams] of [
+      [
+        "workboard.cards.create",
+        {
+          title: "Hijack route",
+          requesterOrigin: { channel: "telegram", to: "attacker" },
+        },
+      ],
+      [
+        "workboard.cards.update",
+        {
+          id: cardId,
+          patch: { metadata: { automation: { flowOwnerSessionKey: "agent:other:main" } } },
+        },
+      ],
+      [
+        "workboard.cards.bulk",
+        { ids: [cardId], patch: { metadata: { automation: { controllerId: "attacker" } } } },
+      ],
+      [
+        "workboard.cards.create",
+        { title: "Inject scheduled policy", requesterOwnerMode: "canonical_main_no_origin" },
+      ],
+    ] as const) {
+      const hijackRespond = vi.fn();
+      await methods
+        .get(method)
+        ?.handler({ params: requestParams, respond: hijackRespond } as never);
+      expect(hijackRespond.mock.calls[0]?.[0]).toBe(false);
+      expect(hijackRespond.mock.calls[0]?.[2]?.message).toContain("reserved");
+    }
 
     const listRespond = vi.fn();
     await listHandler?.({ params: {}, respond: listRespond } as never);
@@ -218,19 +311,23 @@ describe("workboard gateway methods", () => {
     });
   });
 
-  it("dispatches workboard cards when gateway params are omitted", async () => {
+  it("keeps a bound chat route when a client also requests canonical owner mode", async () => {
     type RegisteredMethod = {
       handler: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
       opts: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2];
     };
     const methods = new Map<string, RegisteredMethod>();
-    const run = vi.fn().mockResolvedValue({ runId: "run-card" });
+    const run = vi.fn(async (params: { idempotencyKey?: string }) => ({
+      runId: params.idempotencyKey!,
+    }));
+    const flowRuntime = createManagedFlowRuntime();
     const api = {
       runtime: {
         state: {
           openKeyedStore: vi.fn(() => createMemoryStore()),
         },
-        subagent: { run },
+        subagent: { run, resolveOwnerSession: flowRuntime.resolveOwnerSession },
+        tasks: { managedFlows: flowRuntime.managedFlows },
       },
       registerGatewayMethod: vi.fn(
         (method: string, handler: RegisteredMethod["handler"], opts: RegisteredMethod["opts"]) => {
@@ -243,22 +340,221 @@ describe("workboard gateway methods", () => {
       title: "Ready worker",
       status: "ready",
       priority: "urgent",
+      requesterSessionKey: "agent:main:telegram:direct:requester",
+      requesterOrigin: { channel: "telegram", to: "requester" },
     });
 
     registerWorkboardGatewayMethods({ api, store });
 
     const respond = vi.fn();
-    await methods.get("workboard.cards.dispatch")?.handler({ respond } as never);
+    await methods.get("workboard.cards.dispatch")?.handler({
+      params: { ownerMode: "canonical_main_no_origin" },
+      respond,
+    } as never);
 
     expect(respond.mock.calls[0]?.[0]).toBe(true);
     expect(respond.mock.calls[0]?.[1]).toMatchObject({
-      started: [expect.objectContaining({ cardId: card.id, runId: "run-card" })],
+      started: [
+        expect.objectContaining({
+          cardId: card.id,
+          runId: run.mock.calls[0]?.[0].idempotencyKey,
+        }),
+      ],
     });
     expect(run).toHaveBeenCalledWith(
       expect.objectContaining({
-        sessionKey: `subagent:workboard-default-${card.id}`,
+        sessionKey: `agent:main:subagent:workboard-default-${card.id}`,
       }),
     );
+    expect(flowRuntime.bindSession).toHaveBeenCalledWith({
+      sessionKey: "agent:main:telegram:direct:requester",
+      requesterOrigin: { channel: "telegram", to: "requester" },
+    });
+    expect(flowRuntime.resolveOwnerSession).not.toHaveBeenCalled();
+    await expect(store.get(card.id)).resolves.toMatchObject({
+      status: "running",
+      agentId: "main",
+      metadata: { claim: { ownerId: "main" } },
+    });
+  });
+
+  it("resolves a fixed canonical owner for a route-less write-scoped dashboard dispatch", async () => {
+    type RegisteredMethod = {
+      handler: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
+      opts: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2];
+    };
+    const methods = new Map<string, RegisteredMethod>();
+    const run = vi.fn(async (params: { idempotencyKey?: string }) => ({
+      runId: params.idempotencyKey!,
+    }));
+    const flowRuntime = createManagedFlowRuntime();
+    const resolveOwnerSession = vi.fn(async ({ sessionKey }: { sessionKey: string }) => ({
+      status: "resolved" as const,
+      workerSessionKey: `agent:main:${sessionKey}`,
+      ownerSessionKey: "global",
+      workspaceDir: "/tmp/dashboard-worker-workspace",
+    }));
+    const api = {
+      runtime: {
+        subagent: { run, resolveOwnerSession },
+        tasks: { managedFlows: flowRuntime.managedFlows },
+      },
+      registerGatewayMethod: vi.fn(
+        (method: string, handler: RegisteredMethod["handler"], opts: RegisteredMethod["opts"]) => {
+          methods.set(method, { handler, opts });
+        },
+      ),
+    } as unknown as OpenClawPluginApi;
+    const store = new WorkboardStore(createMemoryStore());
+    const card = await store.create({ title: "Route-less dashboard card", status: "ready" });
+    registerWorkboardGatewayMethods({ api, store });
+
+    const invalidRespond = vi.fn();
+    await methods.get("workboard.cards.dispatch")?.handler({
+      params: { ownerMode: "caller_supplied_route" },
+      client: { connect: { scopes: ["operator.write"] } },
+      respond: invalidRespond,
+    } as never);
+    expect(invalidRespond.mock.calls[0]?.[0]).toBe(false);
+    expect(invalidRespond.mock.calls[0]?.[2]?.message).toContain("unsupported");
+    expect(resolveOwnerSession).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+
+    const respond = vi.fn();
+    await methods.get("workboard.cards.dispatch")?.handler({
+      params: { ownerMode: "canonical_main_no_origin" },
+      client: { connect: { scopes: ["operator.write"] } },
+      respond,
+    } as never);
+
+    const proposedWorker = `subagent:workboard-default-${card.id}`;
+    expect(resolveOwnerSession).toHaveBeenCalledWith({ sessionKey: proposedWorker });
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: `agent:main:${proposedWorker}`,
+        flowOwnerSessionKey: "global",
+        cwd: "/tmp/dashboard-worker-workspace",
+      }),
+    );
+    expect(flowRuntime.bindSession).toHaveBeenCalledWith({ sessionKey: "global" });
+    await expect(store.get(card.id)).resolves.toMatchObject({
+      metadata: {
+        automation: { requesterWorkspace: "/tmp/dashboard-worker-workspace" },
+      },
+    });
+    expect(respond.mock.calls[0]?.[0]).toBe(true);
+    expect(respond.mock.calls[0]?.[1]).toMatchObject({
+      started: [expect.objectContaining({ cardId: card.id })],
+    });
+    await expect(store.get(card.id)).resolves.toMatchObject({
+      status: "running",
+      agentId: "main",
+      sessionKey: `agent:main:${proposedWorker}`,
+      metadata: {
+        claim: { ownerId: "main" },
+        automation: {
+          flowOwnerSessionKey: "global",
+          controllerId: "workboard",
+        },
+      },
+    });
+  });
+
+  it("rejects generic lifecycle mutations and deletion for an active managed card", async () => {
+    type RegisteredMethod = {
+      handler: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
+      opts: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2];
+    };
+    const methods = new Map<string, RegisteredMethod>();
+    const api = {
+      runtime: { subagent: {}, tasks: { managedFlows: {} } },
+      registerGatewayMethod: vi.fn(
+        (method: string, handler: RegisteredMethod["handler"], opts: RegisteredMethod["opts"]) => {
+          methods.set(method, { handler, opts });
+        },
+      ),
+    } as unknown as OpenClawPluginApi;
+    const store = new WorkboardStore(createMemoryStore());
+    const requesterSessionKey = "agent:main:main";
+    const card = await store.create({
+      title: "Managed lifecycle",
+      status: "ready",
+      requesterSessionKey,
+    });
+    await store.projectManagedFlow(card.id, {
+      flowId: "flow-active",
+      flowOwnerSessionKey: requesterSessionKey,
+      flowRevision: 1,
+      controllerId: "workboard",
+      clearRequesterRoute: true,
+    });
+    registerWorkboardGatewayMethods({ api, store });
+
+    for (const [method, requestParams] of [
+      ["workboard.cards.update", { id: card.id, patch: { status: "done" } }],
+      [
+        "workboard.cards.update",
+        { id: card.id, patch: { sessionKey: "agent:other:subagent:hijack", runId: "bad" } },
+      ],
+      ["workboard.cards.move", { id: card.id, status: "done", position: card.position }],
+      ["workboard.cards.bulk", { ids: [card.id], patch: { status: "done" } }],
+      ["workboard.cards.bulk", { ids: [card.id], patch: { agentId: "other" } }],
+      ["workboard.cards.release", { id: card.id, status: "ready" }],
+      ["workboard.cards.promote", { id: card.id }],
+      ["workboard.cards.reassign", { id: card.id, agentId: "other" }],
+      ["workboard.cards.reclaim", { id: card.id, reason: "replace worker" }],
+      ["workboard.cards.block", { id: card.id, reason: "override worker" }],
+      ["workboard.cards.archive", { id: card.id, archived: true }],
+      ["workboard.cards.delete", { id: card.id }],
+    ] as const) {
+      const respond = vi.fn();
+      await methods.get(method)?.handler({ params: requestParams, respond } as never);
+      expect(respond.mock.calls[0]?.[0]).toBe(false);
+    }
+    await expect(store.get(card.id)).resolves.toMatchObject({ status: "ready" });
+  });
+
+  it("fails closed per card when a route-less gateway dispatch omits owner mode", async () => {
+    type RegisteredMethod = {
+      handler: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1];
+      opts: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2];
+    };
+    const methods = new Map<string, RegisteredMethod>();
+    const run = vi.fn();
+    const flowRuntime = createManagedFlowRuntime();
+    const api = {
+      runtime: {
+        subagent: { run, resolveOwnerSession: flowRuntime.resolveOwnerSession },
+        tasks: { managedFlows: flowRuntime.managedFlows },
+      },
+      registerGatewayMethod: vi.fn(
+        (method: string, handler: RegisteredMethod["handler"], opts: RegisteredMethod["opts"]) => {
+          methods.set(method, { handler, opts });
+        },
+      ),
+    } as unknown as OpenClawPluginApi;
+    const store = new WorkboardStore(createMemoryStore());
+    const card = await store.create({ title: "No implicit owner", status: "ready" });
+    registerWorkboardGatewayMethods({ api, store });
+
+    const respond = vi.fn();
+    await methods.get("workboard.cards.dispatch")?.handler({
+      params: {},
+      client: { connect: { scopes: ["operator.write"] } },
+      respond,
+    } as never);
+
+    expect(run).not.toHaveBeenCalled();
+    expect(flowRuntime.resolveOwnerSession).not.toHaveBeenCalled();
+    expect(respond.mock.calls[0]?.[1]).toMatchObject({
+      startFailures: [
+        expect.objectContaining({
+          cardId: card.id,
+          error: "managed Workboard TaskFlow requires an exact initiating requester session",
+        }),
+      ],
+    });
+    await expect(store.get(card.id)).resolves.toMatchObject({ status: "ready" });
   });
 
   it("requires admin scope for managed-worktree dispatch", async () => {
@@ -267,7 +563,10 @@ describe("workboard gateway methods", () => {
       opts: Parameters<OpenClawPluginApi["registerGatewayMethod"]>[2];
     };
     const methods = new Map<string, RegisteredMethod>();
-    const run = vi.fn().mockResolvedValue({ runId: "run-card" });
+    const run = vi.fn(async (params: { idempotencyKey?: string }) => ({
+      runId: params.idempotencyKey!,
+    }));
+    const flowRuntime = createManagedFlowRuntime();
     const createWorktree = vi.fn().mockResolvedValue({
       id: "managed-id",
       path: "/state/worktrees/fingerprint/wb-card",
@@ -275,7 +574,8 @@ describe("workboard gateway methods", () => {
     });
     const api = {
       runtime: {
-        subagent: { run },
+        subagent: { run, resolveOwnerSession: flowRuntime.resolveOwnerSession },
+        tasks: { managedFlows: flowRuntime.managedFlows },
         worktrees: {
           create: createWorktree,
           release: vi.fn(),
@@ -293,6 +593,8 @@ describe("workboard gateway methods", () => {
       title: "Denied checkout",
       status: "ready",
       workspace: { kind: "worktree", path: "/repo-denied" },
+      requesterSessionKey: "agent:main:telegram:direct:requester",
+      requesterOrigin: { channel: "telegram", to: "requester" },
     });
     registerWorkboardGatewayMethods({ api, store });
     const handler = methods.get("workboard.cards.dispatch")?.handler;
@@ -319,6 +621,8 @@ describe("workboard gateway methods", () => {
       title: "Allowed checkout",
       status: "ready",
       workspace: { kind: "worktree", path: "/repo-allowed" },
+      requesterSessionKey: "agent:main:telegram:direct:requester",
+      requesterOrigin: { channel: "telegram", to: "requester" },
     });
     await handler?.({
       client: { connect: { scopes: ["operator.admin"] } },
@@ -350,7 +654,11 @@ describe("workboard gateway methods", () => {
       ),
     } as unknown as OpenClawPluginApi;
 
-    registerWorkboardGatewayMethods({ api, store: new WorkboardStore(createMemoryStore()) });
+    const store = new WorkboardStore(createMemoryStore());
+    const completeCard = vi.fn(
+      async (...args: Parameters<WorkboardStore["complete"]>) => await store.complete(...args),
+    );
+    registerWorkboardGatewayMethods({ api, store, completeCard });
 
     const createRespond = vi.fn();
     await methods.get("workboard.cards.create")?.handler({
@@ -402,6 +710,11 @@ describe("workboard gateway methods", () => {
         },
       },
     });
+    expect(completeCard).toHaveBeenCalledWith(
+      cardId,
+      expect.objectContaining({ summary: "Operator closed it." }),
+      null,
+    );
 
     const blockedCreateRespond = vi.fn();
     await methods.get("workboard.cards.create")?.handler({

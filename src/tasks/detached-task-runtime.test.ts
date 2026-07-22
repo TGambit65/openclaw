@@ -7,6 +7,7 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
   findDetachedTaskRun,
+  findDetachedTaskRunStrict,
   finalizeTaskRunByRunId,
   getDetachedTaskLifecycleRuntime,
   getDetachedTaskLifecycleRuntimeRegistration,
@@ -20,12 +21,17 @@ import {
 } from "./detached-task-runtime.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
-const { mockFindTaskByRunIdForStatus, mockListTasksForSessionKeyForStatus, mockLogWarn } =
-  vi.hoisted(() => ({
-    mockFindTaskByRunIdForStatus: vi.fn(),
-    mockListTasksForSessionKeyForStatus: vi.fn(() => [] as TaskRecord[]),
-    mockLogWarn: vi.fn(),
-  }));
+const {
+  mockFindTaskByRunIdForStatus,
+  mockFindTaskByRunIdForStatusStrict,
+  mockListTasksForSessionKeyForStatus,
+  mockLogWarn,
+} = vi.hoisted(() => ({
+  mockFindTaskByRunIdForStatus: vi.fn(),
+  mockFindTaskByRunIdForStatusStrict: vi.fn(),
+  mockListTasksForSessionKeyForStatus: vi.fn(() => [] as TaskRecord[]),
+  mockLogWarn: vi.fn(),
+}));
 vi.mock("../logging/subsystem.js", () => ({
   createSubsystemLogger: () => ({
     subsystem: "tasks/detached-runtime",
@@ -43,6 +49,7 @@ vi.mock("../logging/subsystem.js", () => ({
 
 vi.mock("./task-status-access.js", () => ({
   findTaskByRunIdForStatus: mockFindTaskByRunIdForStatus,
+  findTaskByRunIdForStatusStrict: mockFindTaskByRunIdForStatusStrict,
   listTasksForSessionKeyForStatus: mockListTasksForSessionKeyForStatus,
 }));
 
@@ -87,6 +94,7 @@ describe("detached-task-runtime", () => {
   afterEach(() => {
     resetDetachedTaskLifecycleRuntimeForTests();
     mockFindTaskByRunIdForStatus.mockReset();
+    mockFindTaskByRunIdForStatusStrict.mockReset();
     mockListTasksForSessionKeyForStatus.mockReset();
     mockListTasksForSessionKeyForStatus.mockReturnValue([]);
     mockLogWarn.mockClear();
@@ -201,6 +209,45 @@ describe("detached-task-runtime", () => {
         error: expect.any(Error),
       }),
     );
+  });
+
+  it("uses the strict exact lookup without adopting a session fallback", () => {
+    const expected = createFakeTaskRecord({
+      taskId: "task-strict",
+      runtime: "subagent",
+      runId: "run-strict",
+      childSessionKey: "agent:main:subagent:strict",
+    });
+    mockFindTaskByRunIdForStatusStrict.mockReturnValue(expected);
+
+    expect(
+      findDetachedTaskRunStrict({
+        runId: "run-strict",
+        runtime: "subagent",
+        sessionKey: "agent:main:subagent:strict",
+        createdAtOrAfter: 1,
+        allowSessionFallback: true,
+      }),
+    ).toEqual({ lookup: "available", task: expected });
+    expect(mockFindTaskByRunIdForStatusStrict).toHaveBeenCalledWith("run-strict");
+    expect(mockFindTaskByRunIdForStatus).not.toHaveBeenCalled();
+    expect(mockListTasksForSessionKeyForStatus).not.toHaveBeenCalled();
+  });
+
+  it("propagates strict core lookup failures", () => {
+    const restoreFailure = new Error("task registry restore failed");
+    mockFindTaskByRunIdForStatusStrict.mockImplementation(() => {
+      throw restoreFailure;
+    });
+
+    expect(() =>
+      findDetachedTaskRunStrict({
+        runId: "run-restore-failed",
+        runtime: "subagent",
+        sessionKey: "agent:main:subagent:restore-failed",
+        createdAtOrAfter: 1,
+      }),
+    ).toThrow(restoreFailure);
   });
 
   it("dispatches lifecycle operations through the installed runtime", async () => {

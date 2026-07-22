@@ -92,20 +92,30 @@ export function restoreSubagentRunsFromDisk(params: {
 export function getSubagentRunsSnapshotForRead(
   inMemoryRuns: Map<string, SubagentRunRecord>,
 ): Map<string, SubagentRunRecord> {
+  try {
+    return getSubagentRunsSnapshotForReadStrict(inMemoryRuns);
+  } catch {
+    return cloneSubagentRunsSnapshot(inMemoryRuns);
+  }
+}
+
+/**
+ * Merge durable and local registry state without converting a durable-read
+ * failure into an apparently authoritative empty snapshot.
+ */
+export function getSubagentRunsSnapshotForReadStrict(
+  inMemoryRuns: Map<string, SubagentRunRecord>,
+): Map<string, SubagentRunRecord> {
   const merged = new Map<string, SubagentRunRecord>();
   const shouldReadDisk =
     process.env.OPENCLAW_TEST_READ_SUBAGENT_RUNS_FROM_DISK === "1" ||
     !(process.env.VITEST || process.env.NODE_ENV === "test");
   if (shouldReadDisk) {
-    try {
-      // Persisted state lets other worker processes observe active runs.
-      // Cache this hot cross-process snapshot briefly; writes refresh the local
-      // cache and the TTL bounds visibility of changes from other processes.
-      for (const [runId, entry] of loadPersistedSubagentRunsForRead().entries()) {
-        merged.set(runId, entry);
-      }
-    } catch {
-      // Ignore disk read failures and fall back to local memory.
+    // Persisted state lets other worker processes observe active runs. Cache
+    // this hot cross-process snapshot briefly; writes refresh the local cache
+    // and the TTL bounds visibility of changes from other processes.
+    for (const [runId, entry] of loadPersistedSubagentRunsForRead().entries()) {
+      merged.set(runId, entry);
     }
   }
   for (const [runId, entry] of inMemoryRuns.entries()) {

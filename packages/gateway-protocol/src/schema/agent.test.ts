@@ -57,6 +57,29 @@ const musicCompletionEvent: AgentInternalEvent = {
 };
 
 describe("AgentParamsSchema", () => {
+  it("accepts the paired managed-flow linkage fields", () => {
+    expect(
+      Value.Check(AgentParamsSchema, {
+        message: "Run the Workboard worker.",
+        sessionKey: "agent:work:subagent:card-1",
+        parentFlowId: "flow-1",
+        flowOwnerSessionKey: "agent:work:main",
+        idempotencyKey: "workboard:card-1:start",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps managed-flow linkage fields non-empty", () => {
+    expect(
+      Value.Check(AgentParamsSchema, {
+        message: "Run the Workboard worker.",
+        parentFlowId: "",
+        flowOwnerSessionKey: "agent:work:main",
+        idempotencyKey: "workboard:card-1:start",
+      }),
+    ).toBe(false);
+  });
+
   it("accepts generated music attachments on internal completion events", () => {
     const params = makeAgentParamsWithInternalEvent(musicCompletionEvent);
 

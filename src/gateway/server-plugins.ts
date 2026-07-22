@@ -11,8 +11,10 @@ import {
 } from "../../packages/gateway-protocol/src/client-info.js";
 import type { ErrorShape } from "../../packages/gateway-protocol/src/index.js";
 import { PROTOCOL_VERSION } from "../../packages/gateway-protocol/src/version.js";
+import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
 import { normalizeModelRef, parseModelRef } from "../agents/model-selection.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { resolveAgentIdFromSessionKey } from "../config/sessions.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizePluginsConfig } from "../plugins/config-state.js";
 import { clearActivatedPluginRuntimeState, loadOpenClawPlugins } from "../plugins/loader.js";
@@ -29,6 +31,7 @@ import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
 import { ADMIN_SCOPE, APPROVALS_SCOPE, WRITE_SCOPE } from "./method-scopes.js";
 import { normalizeOperatorScopeList, type OperatorScope } from "./operator-scopes.js";
+import { resolvePluginSubagentSessionIdentity } from "./plugin-subagent-session-identity.js";
 import type {
   GatewayRequestContext,
   GatewayRequestHandler,
@@ -590,7 +593,7 @@ export async function dispatchTrustedPluginGatewayMethod<T>(
 
 const PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1_000;
 
-export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
+export function createGatewaySubagentRuntime(cfg: OpenClawConfig = {}): PluginRuntime["subagent"] {
   const getSessionMessages: PluginRuntime["subagent"]["getSessionMessages"] = async (params) => {
     const limit =
       params.limit == null || !Number.isFinite(params.limit)
@@ -632,6 +635,14 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
       if (overrideRequested && !allowOverride) {
         throw new Error("provider/model override is not authorized for this plugin subagent run.");
       }
+      const parentFlowId = params.parentFlowId?.trim();
+      const flowOwnerSessionKey = params.flowOwnerSessionKey?.trim();
+      if (Boolean(parentFlowId) !== Boolean(flowOwnerSessionKey)) {
+        throw new Error("parentFlowId and flowOwnerSessionKey must be provided together.");
+      }
+      if (parentFlowId && pluginId !== "workboard") {
+        throw new Error("managed-flow linkage is reserved for Workboard.");
+      }
       const payload = await dispatchGatewayMethod<{ runId?: string }>(
         "agent",
         {
@@ -643,6 +654,7 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
           ...(params.extraSystemPrompt && { extraSystemPrompt: params.extraSystemPrompt }),
           ...(params.lane && { lane: params.lane }),
           ...(params.cwd && { cwd: params.cwd }),
+          ...(parentFlowId && flowOwnerSessionKey ? { parentFlowId, flowOwnerSessionKey } : {}),
           ...(params.lightContext === true && { bootstrapContextMode: "lightweight" }),
           // The gateway `agent` schema requires `idempotencyKey: NonEmptyString`,
           // so fall back to a generated UUID when the caller omits it. Without
@@ -661,6 +673,26 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
         throw new Error("Gateway agent method returned an invalid runId.");
       }
       return { runId };
+    },
+    async resolveOwnerSession(params) {
+      const scope = getPluginRuntimeGatewayRequestScope();
+      if (scope?.pluginId !== "workboard") {
+        return { status: "unknown" };
+      }
+      const identity = resolvePluginSubagentSessionIdentity({
+        cfg,
+        sessionKey: params.sessionKey,
+      });
+      return identity
+        ? {
+            status: "resolved",
+            ...identity,
+            workspaceDir: resolveAgentWorkspaceDir(
+              cfg,
+              resolveAgentIdFromSessionKey(identity.workerSessionKey),
+            ),
+          }
+        : { status: "unknown" };
     },
     async waitForRun(params) {
       const payload = await dispatchGatewayMethod<{ status?: string; error?: string }>(
@@ -685,6 +717,54 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
           typeof payload?.error === "string" &&
           payload.error && { error: payload.error }),
       };
+    },
+    async getRecoveryOwnership(params) {
+      const scope = getPluginRuntimeGatewayRequestScope();
+      if (scope?.pluginId !== "workboard") {
+        return { status: "unknown" };
+      }
+      const { querySubagentRecoveryOwnership } = await import("../agents/subagent-registry.js");
+      return querySubagentRecoveryOwnership({
+        childSessionKey: params.sessionKey,
+        predecessorRunId: params.runId,
+      });
+    },
+    async getRunState(params) {
+      const scope = getPluginRuntimeGatewayRequestScope();
+      if (scope?.pluginId !== "workboard") {
+        return { status: "unknown" };
+      }
+      const { queryWorkboardSubagentRunState } = await import("../agents/subagent-registry.js");
+      return queryWorkboardSubagentRunState({
+        childSessionKey: params.sessionKey,
+        runId: params.runId,
+      });
+    },
+    async requireCompletionDelivery(params) {
+      const scope = getPluginRuntimeGatewayRequestScope();
+      if (scope?.pluginId !== "workboard") {
+        return { status: "unknown" };
+      }
+      const { requireWorkboardSubagentCompletionDelivery } =
+        await import("../agents/subagent-registry.js");
+      return requireWorkboardSubagentCompletionDelivery({
+        childSessionKey: params.sessionKey,
+        runId: params.runId,
+        obligationId: params.idempotencyKey,
+        cardId: params.cardId,
+        expectedRunId: params.expectedRunId,
+        expectedRevision: params.expectedRevision,
+        claimOwnerId: params.claimOwnerId,
+        summary: params.summary,
+        completionText: params.completionText,
+        proof: params.proof,
+        artifacts: params.artifacts,
+        createdCardIds: params.createdCardIds,
+        flowId: params.flowId,
+        flowOwnerSessionKey: params.flowOwnerSessionKey,
+        flowRevision: params.flowRevision,
+        controllerId: params.controllerId,
+      });
     },
     getSessionMessages,
     async getSession(params) {

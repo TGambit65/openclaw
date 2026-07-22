@@ -7,6 +7,7 @@ import {
   resetRuntimeTaskTestState,
 } from "./runtime-task-test-harness.js";
 import { createRuntimeTaskFlow } from "./runtime-taskflow.js";
+import type { BoundTaskFlowRuntime } from "./runtime-taskflow.types.js";
 
 function requireCreatedFlow<T>(flow: T | null): T {
   if (!flow) {
@@ -136,5 +137,58 @@ describe("runtime TaskFlow", () => {
     }
     expect(summary.total).toBe(1);
     expect(summary.active).toBe(1);
+  });
+
+  it.each([
+    [
+      "setWaiting",
+      (taskFlow: BoundTaskFlowRuntime, flowId: string, expectedRevision: number) =>
+        taskFlow.setWaiting({
+          flowId,
+          expectedRevision,
+          completionAcceptedAt: 101,
+        }),
+    ],
+    [
+      "finish",
+      (taskFlow: BoundTaskFlowRuntime, flowId: string, expectedRevision: number) =>
+        taskFlow.finish({
+          flowId,
+          expectedRevision,
+          completionAcceptedAt: 101,
+        }),
+    ],
+    [
+      "fail",
+      (taskFlow: BoundTaskFlowRuntime, flowId: string, expectedRevision: number) =>
+        taskFlow.fail({
+          flowId,
+          expectedRevision,
+          completionAcceptedAt: 101,
+        }),
+    ],
+  ] as const)("forwards completionAcceptedAt through %s", (_name, mutate) => {
+    const taskFlow = createRuntimeTaskFlow().bindSession({
+      sessionKey: "agent:main:main",
+    });
+    const created = requireCreatedFlow(
+      taskFlow.createManaged({
+        controllerId: "tests/runtime-taskflow",
+        goal: "Reject completion accepted after cancellation",
+        cancelRequestedAt: 100,
+      }),
+    );
+
+    const result = mutate(taskFlow, created.flowId, created.revision);
+
+    expect(result).toMatchObject({
+      applied: false,
+      code: "completion_cancel_conflict",
+    });
+    expect(taskFlow.get(created.flowId)).toMatchObject({
+      status: created.status,
+      revision: created.revision,
+      cancelRequestedAt: 100,
+    });
   });
 });

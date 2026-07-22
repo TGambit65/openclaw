@@ -35,6 +35,7 @@ function buildPluginParams(
       to: "test-bot",
     },
     sessionKey: "agent:main:whatsapp:direct:test-user",
+    workspaceDir: "/tmp/plugin-command-workspace",
     sessionEntry: {
       sessionId: "session-plugin-command",
       updatedAt: Date.now(),
@@ -69,6 +70,7 @@ describe("handlePluginCommand", () => {
       [
         {
           gatewayClientScopes?: string[];
+          workspaceDir?: string;
           sessionKey?: string;
           sessionId?: string;
           commandBody?: string;
@@ -76,6 +78,7 @@ describe("handlePluginCommand", () => {
       ]
     >;
     expect(commandParams.gatewayClientScopes).toEqual(["operator.write", "operator.pairing"]);
+    expect(commandParams.workspaceDir).toBe("/tmp/plugin-command-workspace");
     expect(commandParams.sessionKey).toBe("agent:main:whatsapp:direct:test-user");
     expect(commandParams.sessionId).toBe("session-plugin-command");
     expect(commandParams.commandBody).toBe("/card");

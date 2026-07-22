@@ -100,6 +100,16 @@ export type DetachedTaskFinalizeParams = {
   suppressDelivery?: boolean;
 };
 
+export type DetachedTaskVerifiedWorkboardCompletionParams = {
+  taskId: string;
+  runId: string;
+  sessionKey: string;
+  flowId: string;
+  acceptedAt: number;
+  endedAt: number;
+  completionText: string;
+};
+
 export type DetachedTaskTerminalState = Omit<
   DetachedTaskFinalizeParams,
   "runId" | "runtime" | "sessionKey"
@@ -156,6 +166,9 @@ export type DetachedTaskLifecycleRuntime = {
   startTaskRunByRunId: (params: DetachedTaskStartParams) => TaskRecord[];
   recordTaskRunProgressByRunId: (params: DetachedTaskProgressParams) => TaskRecord[];
   finalizeTaskRunByRunId?: (params: DetachedTaskFinalizeParams) => TaskRecord[];
+  reconcileVerifiedWorkboardCompletion?: (
+    params: DetachedTaskVerifiedWorkboardCompletionParams,
+  ) => TaskRecord | null;
   completeTaskRunByRunId: (params: DetachedTaskCompleteParams) => TaskRecord[];
   failTaskRunByRunId: (params: DetachedTaskFailParams) => TaskRecord[];
   setDetachedTaskDeliveryStatusByRunId: (params: DetachedTaskDeliveryStatusParams) => TaskRecord[];

@@ -1,10 +1,13 @@
 // Filters task status visibility by requester, owner, and flow scope.
 import {
   findTaskByRunId,
+  findTaskByRunIdStrict,
   getTaskById,
   listTaskRecords,
+  listTasksByRunId,
   listTasksForAgentId,
   listTasksForSessionKey,
+  listTasksForSessionKeyStrict,
 } from "./task-registry.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
@@ -30,6 +33,10 @@ export function listTasksForSessionKeyForStatus(sessionKey: string): TaskRecord[
   return listTasksForSessionKey(sessionKey);
 }
 
+export function listTasksForSessionKeyForStatusStrict(sessionKey: string): TaskRecord[] {
+  return listTasksForSessionKeyStrict(sessionKey);
+}
+
 export function listTasksForOwnerOrRequesterSessionKeyForStatus(sessionKey: string): TaskRecord[] {
   return listTaskRecords().filter(
     (task) => task.requesterSessionKey === sessionKey || task.ownerKey === sessionKey,
@@ -42,4 +49,12 @@ export function listTasksForAgentIdForStatus(agentId: string): TaskRecord[] {
 
 export function findTaskByRunIdForStatus(runId: string): TaskRecord | undefined {
   return findTaskByRunId(runId);
+}
+
+export function findTaskByRunIdForStatusStrict(runId: string): TaskRecord | undefined {
+  return findTaskByRunIdStrict(runId);
+}
+
+export function listTasksByRunIdForStatus(runId: string): TaskRecord[] {
+  return listTasksByRunId(runId);
 }

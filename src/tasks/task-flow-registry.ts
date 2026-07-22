@@ -89,7 +89,7 @@ export type TaskFlowUpdateResult =
     }
   | {
       applied: false;
-      reason: "not_found" | "revision_conflict" | "persist_failed";
+      reason: "not_found" | "revision_conflict" | "persist_failed" | "completion_cancel_conflict";
       current?: TaskFlowRecord;
     };
 
@@ -533,6 +533,64 @@ export function updateFlowRecordByIdExpectedRevision(params: {
   };
 }
 
+function updateFlowRecordForVerifiedCompletion(params: {
+  flowId: string;
+  expectedRevision: number;
+  completionAcceptedAt: number;
+  patch: FlowRecordPatch;
+}): TaskFlowUpdateResult {
+  ensureFlowRegistryReady();
+  const current = flows.get(params.flowId);
+  if (!current) {
+    return { applied: false, reason: "not_found" };
+  }
+  if (current.revision !== params.expectedRevision) {
+    return {
+      applied: false,
+      reason: "revision_conflict",
+      current: cloneFlowRecord(current),
+    };
+  }
+  if (
+    !Number.isFinite(params.completionAcceptedAt) ||
+    params.completionAcceptedAt < 0 ||
+    (current.cancelRequestedAt !== undefined &&
+      params.completionAcceptedAt > current.cancelRequestedAt)
+  ) {
+    return {
+      applied: false,
+      reason: "completion_cancel_conflict",
+      current: cloneFlowRecord(current),
+    };
+  }
+  const flow = writeFlowRecord(
+    applyFlowPatch(current, { ...params.patch, cancelRequestedAt: null }),
+    current,
+  );
+  if (!flow) {
+    return {
+      applied: false,
+      reason: "persist_failed",
+      current: cloneFlowRecord(current),
+    };
+  }
+  return { applied: true, flow };
+}
+
+function updateFlowRecordForLifecycle(params: {
+  flowId: string;
+  expectedRevision: number;
+  completionAcceptedAt?: number;
+  patch: FlowRecordPatch;
+}): TaskFlowUpdateResult {
+  return params.completionAcceptedAt === undefined
+    ? updateFlowRecordByIdExpectedRevision(params)
+    : updateFlowRecordForVerifiedCompletion({
+        ...params,
+        completionAcceptedAt: params.completionAcceptedAt,
+      });
+}
+
 export function setFlowWaiting(params: {
   flowId: string;
   expectedRevision: number;
@@ -542,10 +600,12 @@ export function setFlowWaiting(params: {
   blockedTaskId?: string | null;
   blockedSummary?: string | null;
   updatedAt?: number;
+  completionAcceptedAt?: number;
 }): TaskFlowUpdateResult {
-  return updateFlowRecordByIdExpectedRevision({
+  return updateFlowRecordForLifecycle({
     flowId: params.flowId,
     expectedRevision: params.expectedRevision,
+    completionAcceptedAt: params.completionAcceptedAt,
     patch: {
       status:
         normalizeOptionalString(params.blockedTaskId) ||
@@ -594,11 +654,13 @@ export function finishFlow(params: {
   stateJson?: JsonValue | null;
   updatedAt?: number;
   endedAt?: number;
+  completionAcceptedAt?: number;
 }): TaskFlowUpdateResult {
   const endedAt = params.endedAt ?? params.updatedAt ?? Date.now();
-  return updateFlowRecordByIdExpectedRevision({
+  return updateFlowRecordForLifecycle({
     flowId: params.flowId,
     expectedRevision: params.expectedRevision,
+    completionAcceptedAt: params.completionAcceptedAt,
     patch: {
       status: "succeeded",
       currentStep: params.currentStep,
@@ -621,11 +683,13 @@ export function failFlow(params: {
   blockedSummary?: string | null;
   updatedAt?: number;
   endedAt?: number;
+  completionAcceptedAt?: number;
 }): TaskFlowUpdateResult {
   const endedAt = params.endedAt ?? params.updatedAt ?? Date.now();
-  return updateFlowRecordByIdExpectedRevision({
+  return updateFlowRecordForLifecycle({
     flowId: params.flowId,
     expectedRevision: params.expectedRevision,
+    completionAcceptedAt: params.completionAcceptedAt,
     patch: {
       status: "failed",
       currentStep: params.currentStep,

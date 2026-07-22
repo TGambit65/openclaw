@@ -90,7 +90,9 @@ openclaw workboard dispatch --json
 openclaw workboard dispatch --url http://127.0.0.1:18789 --token "$OPENCLAW_GATEWAY_TOKEN"
 ```
 
-`dispatch` first calls the running Gateway RPC method `workboard.cards.dispatch`, which uses the same subagent runtime as the dashboard dispatch action, so ready cards become task-tracked worker runs with linked session keys. Cards with an assigned agent use agent-scoped subagent session keys; unassigned cards keep an unscoped subagent key so the Gateway's configured default agent is preserved.
+`dispatch` first calls the running Gateway RPC method `workboard.cards.dispatch`, which uses the same subagent runtime as the dashboard dispatch action, so ready cards become task-tracked worker runs with linked session keys. The Gateway resolves both the worker and owner through its canonical session resolver: assigned cards use that agent, while unassigned cards use the configured default agent. Both receive agent-scoped canonical worker keys, including when the configured owner session is global.
+
+CLI and dashboard dispatch use the fixed `canonical_main_no_origin` owner policy for cards that were not created from a chat request. Their verified completion is acknowledged in the canonical main session and projected into Workboard, with no external channel origin. Cards created from chat retain their exact initiating session and channel route instead.
 
 The dispatch loop:
 
@@ -141,7 +143,7 @@ Slash command dispatch also uses the Gateway subagent runtime, so it follows the
 
 ## Permissions
 
-The CLI dispatch path calls Gateway RPC with `operator.read` and `operator.write` scopes. A read-only Gateway token can inspect Workboard data through read methods, but it cannot create cards or dispatch workers.
+The CLI dispatch path calls Gateway RPC with `operator.read` and `operator.write` scopes. The fixed canonical owner policy does not accept an arbitrary session or channel target. A read-only Gateway token can inspect Workboard data through read methods, but it cannot create cards or dispatch workers. Dispatching a card that requests a managed worktree additionally requires `operator.admin`; without it, that card remains ready and reports a start failure.
 
 Local `list`, `create`, and `show` commands operate on the local OpenClaw state directory used by the current profile. Use `--dev` or `--profile <name>` on the top-level `openclaw` command when you need a different state root.
 

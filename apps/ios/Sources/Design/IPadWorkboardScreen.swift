@@ -813,7 +813,9 @@ struct IPadWorkboardScreen: View {
         do {
             let data = try await request(
                 method: "workboard.cards.dispatch",
-                params: IPadWorkboardListParams(boardId: selectedBoardParam),
+                params: IPadWorkboardDispatchParams(
+                    boardId: selectedBoardParam,
+                    ownerMode: "canonical_main_no_origin"),
                 timeoutSeconds: 45)
             self.dispatchSummaryText = try JSONDecoder()
                 .decode(IPadWorkboardDispatchSummary.self, from: data)
@@ -1414,6 +1416,11 @@ struct IPadWorkboardAutomationMetadata: Decodable {
 
 private struct IPadWorkboardListParams: Encodable {
     let boardId: String?
+}
+
+private struct IPadWorkboardDispatchParams: Encodable {
+    let boardId: String?
+    let ownerMode: String
 }
 
 private struct IPadWorkboardCreateParams: Encodable {

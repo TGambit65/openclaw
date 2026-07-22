@@ -2,9 +2,19 @@
 import { jsonResult, readStringParam } from "openclaw/plugin-sdk/core";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenClawPluginToolContext } from "openclaw/plugin-sdk/plugin-entry";
+import {
+  isAcpSessionKey,
+  isCronSessionKey,
+  isSubagentSessionKey,
+  parseAgentSessionKey,
+} from "openclaw/plugin-sdk/routing";
 import { Type } from "typebox";
+import type { WorkboardCompletionCoordinator } from "./completion-delivery.js";
+import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
+import { settleBlockedWorkboardManagedFlow } from "./managed-flow.js";
+import { redactWorkboardCardForExternalView } from "./redaction.js";
 import { WorkboardStore } from "./store.js";
-import type { WorkboardCard } from "./types.js";
+import type { WorkboardCard, WorkboardManagedFlowView } from "./types.js";
 
 function contextOwner(ctx: OpenClawPluginToolContext | undefined): string {
   const record = (ctx ?? {}) as Record<string, unknown>;
@@ -13,6 +23,19 @@ function contextOwner(ctx: OpenClawPluginToolContext | undefined): string {
     (typeof record.sessionKey === "string" && record.sessionKey) ||
     (typeof record.sessionId === "string" && record.sessionId) ||
     "agent"
+  );
+}
+
+function requiresCanonicalRequesterPolicy(sessionKey: string | undefined): boolean {
+  if (!sessionKey) {
+    return false;
+  }
+  const parsed = parseAgentSessionKey(sessionKey);
+  return (
+    isCronSessionKey(sessionKey) ||
+    isSubagentSessionKey(sessionKey) ||
+    isAcpSessionKey(sessionKey) ||
+    Boolean(parsed?.rest.split(":").includes("heartbeat"))
   );
 }
 
@@ -112,20 +135,7 @@ function summarizeCard(card: WorkboardCard) {
 }
 
 function redactClaimToken(card: WorkboardCard): WorkboardCard {
-  const claim = card.metadata?.claim;
-  if (!claim) {
-    return card;
-  }
-  return {
-    ...card,
-    metadata: {
-      ...card.metadata,
-      claim: {
-        ...claim,
-        token: "[redacted]",
-      },
-    },
-  };
+  return redactWorkboardCardForExternalView(card);
 }
 
 type WorkboardToolCardParams = {
@@ -189,9 +199,29 @@ export function createWorkboardTools(params: {
   api: OpenClawPluginApi;
   context?: OpenClawPluginToolContext;
   store?: WorkboardStore;
+  completeCard?: WorkboardCompletionCoordinator;
+  readManagedFlow?: (card: WorkboardCard) => WorkboardManagedFlowView | undefined;
+  onReconciliationNeeded?: () => Promise<void> | void;
 }): AnyAgentTool[] {
   const store = params.store ?? WorkboardStore.openSqlite();
+  const completeCard =
+    params.completeCard ?? (async (id, input, scope) => await store.complete(id, input, scope));
   const ownerId = contextOwner(params.context);
+  const rawRequesterSessionKey = params.context?.sessionKey?.trim();
+  const requesterUsesCanonicalPolicy = requiresCanonicalRequesterPolicy(rawRequesterSessionKey);
+  const requesterSessionKey = requesterUsesCanonicalPolicy ? undefined : rawRequesterSessionKey;
+  const requesterOrigin =
+    !requesterUsesCanonicalPolicy && params.context?.deliveryContext
+      ? {
+          channel: params.context.deliveryContext.channel,
+          to: params.context.deliveryContext.to,
+          accountId: params.context.deliveryContext.accountId,
+          threadId: params.context.deliveryContext.threadId,
+        }
+      : undefined;
+  const requesterWorkspace = requesterUsesCanonicalPolicy
+    ? undefined
+    : params.context?.workspaceDir?.trim();
   const readScopedCardToolParams = async (rawParams: unknown): Promise<WorkboardToolCardParams> => {
     const input = readCardToolParams(rawParams, ownerId);
     await requireScopedCard(store, input.id, ownerId, input.token);
@@ -304,7 +334,15 @@ export function createWorkboardTools(params: {
         { additionalProperties: false },
       ),
       execute: async (_toolCallId, rawParams) => {
-        const record = rawParams as Record<string, unknown>;
+        const record: Record<string, unknown> = {
+          ...(rawParams as Record<string, unknown>),
+          ...(requesterSessionKey ? { requesterSessionKey } : {}),
+          ...(requesterUsesCanonicalPolicy
+            ? { requesterOwnerMode: "canonical_main_no_origin" }
+            : {}),
+          ...(requesterOrigin ? { requesterOrigin } : {}),
+          ...(requesterWorkspace ? { requesterWorkspace } : {}),
+        };
         readParentIds(record.parents);
         return jsonResult({
           card: redactClaimToken(
@@ -342,7 +380,7 @@ export function createWorkboardTools(params: {
       name: "workboard_read",
       label: "Workboard Read",
       description:
-        "Read one Workboard card and return bounded worker context with notes, attempts, comments, proof, links, and diagnostics.",
+        "Read one Workboard card, its authoritative managed-flow status/current wait, and bounded worker context.",
       parameters: CardIdSchema,
       execute: async (_toolCallId, rawParams) => {
         const record = rawParams as Record<string, unknown>;
@@ -353,6 +391,7 @@ export function createWorkboardTools(params: {
         }
         return jsonResult({
           card: redactClaimToken(card),
+          ...(params.readManagedFlow?.(card) ? { managedFlow: params.readManagedFlow(card) } : {}),
           workerContext: await store.buildWorkerContext(id),
         });
       },
@@ -490,7 +529,7 @@ export function createWorkboardTools(params: {
       name: "workboard_complete",
       label: "Workboard Complete",
       description:
-        "Complete a claimed Workboard card with a structured summary, proof, artifacts, and created-card manifest.",
+        "Finish a claimed workflow with verified proof and artifacts. Autonomous work remains waiting/review until native requester delivery is acknowledged.",
       parameters: Type.Object(
         {
           id: cardIdField(),
@@ -531,7 +570,7 @@ export function createWorkboardTools(params: {
       ),
       execute: async (_toolCallId, rawParams) => {
         return runClaimedCardMutation(rawParams, (id, record, scope) =>
-          store.complete(id, record, scope),
+          completeCard(id, record, scope),
         );
       },
     },
@@ -608,15 +647,27 @@ export function createWorkboardTools(params: {
         { additionalProperties: false },
       ),
       execute: async (_toolCallId, rawParams) => {
-        return runClaimedCardMutation(rawParams, (id, record, scope) =>
-          store.block(id, record, scope),
-        );
+        const { record, id, scope } = await readClaimedCardToolParams(rawParams);
+        const blocked = await store.block(id, record, scope);
+        try {
+          return redactedCardResult(
+            await settleBlockedWorkboardManagedFlow({
+              store,
+              card: blocked,
+              managedFlows: params.api.runtime.tasks.managedFlows,
+            }),
+          );
+        } catch (error) {
+          await params.onReconciliationNeeded?.();
+          throw error;
+        }
       },
     },
     {
       name: "workboard_unblock",
       label: "Workboard Unblock",
-      description: "Move a blocked Workboard card back to todo after adding enough context.",
+      description:
+        "Resume step 1 of 2: move a blocked workflow back to todo after adding context, then call workboard_dispatch to resume/start it.",
       parameters: CardIdSchema,
       execute: async (_toolCallId, rawParams) => {
         const { id, scope } = await readScopedCardToolParams(rawParams);
@@ -724,7 +775,13 @@ export function createWorkboardTools(params: {
       execute: async (_toolCallId, rawParams) => {
         const id = readStringParam(rawParams as Record<string, unknown>, "id", { required: true });
         const result = await store.runs(id);
-        return jsonResult({ ...result, card: redactClaimToken(result.card) });
+        return jsonResult({
+          ...result,
+          card: redactClaimToken(result.card),
+          ...(params.readManagedFlow?.(result.card)
+            ? { managedFlow: params.readManagedFlow(result.card) }
+            : {}),
+        });
       },
     },
     {
@@ -835,7 +892,8 @@ export function createWorkboardTools(params: {
     {
       name: "workboard_notify_subscribe",
       label: "Workboard Notify Subscribe",
-      description: "Persist a Workboard notification subscription in the plugin SQLite store.",
+      description:
+        "Begin a durable wait by persisting a replay-safe completion/failure/stale subscription.",
       parameters: Type.Object(
         {
           boardId: Type.Optional(Type.String({ description: "Board id. Default default." })),
@@ -871,7 +929,8 @@ export function createWorkboardTools(params: {
     {
       name: "workboard_notify_events",
       label: "Workboard Notify Events",
-      description: "Read replay-safe Workboard notification events without advancing cursors.",
+      description:
+        "Poll a durable workflow wait: read replay-safe completion/failure/stale events without advancing its cursor.",
       parameters: Type.Object(
         {
           subscriptionId: Type.Optional(Type.String({ description: "Subscription id." })),
@@ -887,7 +946,8 @@ export function createWorkboardTools(params: {
     {
       name: "workboard_notify_advance",
       label: "Workboard Notify Advance",
-      description: "Read Workboard notification events and advance the subscription cursor.",
+      description:
+        "Acknowledge a durable wait by reading events and atomically advancing its subscription cursor.",
       parameters: Type.Object(
         {
           subscriptionId: Type.String({ description: "Subscription id." }),
@@ -978,7 +1038,7 @@ export function createWorkboardTools(params: {
       name: "workboard_dispatch",
       label: "Workboard Dispatch",
       description:
-        "Run one Workboard dispatcher pass: promote unblocked cards, reclaim expired claims, and block timed-out runs.",
+        "Start ready workflows and resume recoverable managed flows; status/wait is available through workboard_read or workboard_runs.",
       parameters: Type.Object(
         {
           boardId: Type.Optional(Type.String({ description: "Optional board id filter." })),
@@ -990,7 +1050,42 @@ export function createWorkboardTools(params: {
           rawParams && typeof rawParams === "object" && !Array.isArray(rawParams)
             ? (rawParams as Record<string, unknown>)
             : {};
-        const result = await store.dispatch({ boardId: record.boardId });
+        const boardId = typeof record.boardId === "string" ? record.boardId : undefined;
+        const result = await dispatchAndStartWorkboardCards({
+          store,
+          subagent: params.api.runtime.subagent,
+          managedFlows: params.api.runtime.tasks.managedFlows,
+          worktrees: params.api.runtime.worktrees,
+          options: {
+            boardId,
+            allowManagedWorktrees: true,
+            ownerId,
+            requesterSessionKey,
+            requesterOrigin,
+            requesterWorkspace,
+            resolveRequesterRouteForCard: async (_card, proposedWorkerSessionKey) => {
+              const resolved = await params.api.runtime.subagent.resolveOwnerSession({
+                sessionKey: proposedWorkerSessionKey,
+              });
+              if (
+                resolved.status !== "resolved" ||
+                !resolved.workerSessionKey?.trim() ||
+                !resolved.ownerSessionKey?.trim() ||
+                !resolved.workspaceDir?.trim()
+              ) {
+                throw new Error("canonical Workboard owner route is unavailable");
+              }
+              return {
+                workerSessionKey: resolved.workerSessionKey.trim(),
+                ownerSessionKey: resolved.ownerSessionKey.trim(),
+                workspaceDir: resolved.workspaceDir.trim(),
+              };
+            },
+          },
+        });
+        if (result.needsReconciliation) {
+          await params.onReconciliationNeeded?.();
+        }
         return jsonResult({
           ...result,
           promoted: result.promoted.map(redactClaimToken),

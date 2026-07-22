@@ -9,6 +9,10 @@ import type {
   PersistedWorkboardBoard,
   PersistedWorkboardCard,
   PersistedWorkboardNotificationSubscription,
+  WorkboardCardBatchMutation,
+  WorkboardCardBatchMutationResult,
+  WorkboardCardCompareAndSwapOptions,
+  WorkboardCardCompareAndSwapResult,
   WorkboardKeyedStore,
 } from "./persistence-types.js";
 import type {
@@ -28,10 +32,11 @@ import type {
 } from "./types.js";
 
 const WORKBOARD_DB_RELATIVE_PATH = ["plugins", "workboard", "workboard.sqlite"] as const;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const WORKBOARD_SQLITE_BUSY_TIMEOUT_MS = 5000;
 const WORKBOARD_SQLITE_DIR_MODE = 0o700;
 const WORKBOARD_SQLITE_FILE_MODE = 0o600;
+const DEFAULT_DISPATCH_OWNER = "workboard-dispatcher";
 
 type Row = Record<string, unknown>;
 
@@ -270,6 +275,9 @@ function ensureWorkboardSchema(db: DatabaseSync): void {
       url TEXT,
       path TEXT,
       mime_type TEXT,
+      byte_size INTEGER,
+      sha256 TEXT,
+      verified_at INTEGER,
       created_at INTEGER NOT NULL
     );
 
@@ -357,6 +365,9 @@ function ensureWorkboardSchema(db: DatabaseSync): void {
     "lifecycle_status_source_updated_at",
     "lifecycle_status_source_updated_at INTEGER",
   );
+  ensureColumn(db, "workboard_card_artifacts", "byte_size", "byte_size INTEGER");
+  ensureColumn(db, "workboard_card_artifacts", "sha256", "sha256 TEXT");
+  ensureColumn(db, "workboard_card_artifacts", "verified_at", "verified_at INTEGER");
   db.prepare(
     "INSERT OR IGNORE INTO workboard_schema_migrations (id, applied_at) VALUES (?, ?)",
   ).run(`schema-${SCHEMA_VERSION}`, Date.now());
@@ -580,6 +591,9 @@ function readMetadata(db: DatabaseSync, row: Row): WorkboardMetadata | undefined
     const url = stringValue(child, "url");
     const artifactPath = stringValue(child, "path");
     const mimeType = stringValue(child, "mime_type");
+    const byteSize = numberValue(child, "byte_size");
+    const sha256 = stringValue(child, "sha256");
+    const verifiedAt = numberValue(child, "verified_at");
     if (label) {
       entry.label = label;
     }
@@ -591,6 +605,15 @@ function readMetadata(db: DatabaseSync, row: Row): WorkboardMetadata | undefined
     }
     if (mimeType) {
       entry.mimeType = mimeType;
+    }
+    if (byteSize !== undefined && byteSize >= 0) {
+      entry.byteSize = byteSize;
+    }
+    if (sha256) {
+      entry.sha256 = sha256;
+    }
+    if (verifiedAt !== undefined && verifiedAt > 0) {
+      entry.verifiedAt = verifiedAt;
     }
     return entry;
   });
@@ -952,8 +975,8 @@ function insertCard(db: DatabaseSync, card: WorkboardCard): void {
     db.prepare(
       `
         INSERT INTO workboard_card_artifacts
-          (id, card_id, ordinal, label, url, path, mime_type, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (id, card_id, ordinal, label, url, path, mime_type, byte_size, sha256, verified_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
     ).run(
       entry.id,
@@ -963,6 +986,9 @@ function insertCard(db: DatabaseSync, card: WorkboardCard): void {
       bindNull(entry.url),
       bindNull(entry.path),
       bindNull(entry.mimeType),
+      bindNull(entry.byteSize),
+      bindNull(entry.sha256),
+      bindNull(entry.verifiedAt),
       entry.createdAt,
     );
   });
@@ -1083,6 +1109,117 @@ class WorkboardSqliteCardStore implements WorkboardKeyedStore {
       throw new Error("invalid workboard card payload");
     }
     runTransaction(this.db, () => insertCard(this.db, value.card));
+  }
+
+  async compareAndSwap(
+    key: string,
+    value: PersistedWorkboardCard,
+    options: WorkboardCardCompareAndSwapOptions,
+  ): Promise<WorkboardCardCompareAndSwapResult> {
+    if (value.version !== 1 || value.card.id !== key) {
+      throw new Error("invalid workboard card payload");
+    }
+    return runTransaction(this.db, () => {
+      const latestEvent = this.db
+        .prepare(
+          `
+            SELECT id
+            FROM workboard_card_events
+            WHERE card_id = ?
+            ORDER BY ordinal DESC
+            LIMIT 1
+          `,
+        )
+        .get(key) as Row | undefined;
+      if (stringValue(latestEvent ?? {}, "id") !== options.expectedRevision) {
+        return "stale";
+      }
+      if (options.ownerSlotId) {
+        const ignoredIds = new Set(options.ignoredOwnerSlotCardIds ?? []);
+        const activeRows = this.db
+          .prepare(
+            `
+              SELECT id, agent_id, claim_json
+              FROM workboard_cards
+              WHERE id <> ?
+                AND archived_at IS NULL
+                AND (status = 'running' OR claim_json IS NOT NULL OR execution_status = 'running')
+            `,
+          )
+          .all(key) as Row[];
+        const ownerBusy = activeRows.some((row) => {
+          const cardId = stringValue(row, "id");
+          if (!cardId || ignoredIds.has(cardId)) {
+            return false;
+          }
+          const claim = parseJson(row.claim_json);
+          const claimOwnerId =
+            claim && typeof claim === "object" && !Array.isArray(claim)
+              ? stringValue(claim as Row, "ownerId")
+              : undefined;
+          const ownerSlot = claimOwnerId ?? stringValue(row, "agent_id") ?? DEFAULT_DISPATCH_OWNER;
+          return ownerSlot === options.ownerSlotId;
+        });
+        if (ownerBusy) {
+          return "owner_busy";
+        }
+      }
+      insertCard(this.db, value.card);
+      return "updated";
+    });
+  }
+
+  async compareAndSwapBatch(
+    mutation: WorkboardCardBatchMutation,
+  ): Promise<WorkboardCardBatchMutationResult> {
+    const seenChecks = new Set<string>();
+    for (const check of mutation.checks) {
+      if (!check.key || seenChecks.has(check.key)) {
+        throw new Error("invalid or duplicate workboard batch check");
+      }
+      seenChecks.add(check.key);
+    }
+    const seenUpserts = new Set<string>();
+    for (const upsert of mutation.upserts) {
+      if (
+        !upsert.key ||
+        seenUpserts.has(upsert.key) ||
+        upsert.value.version !== 1 ||
+        upsert.value.card.id !== upsert.key
+      ) {
+        throw new Error("invalid or duplicate workboard batch upsert");
+      }
+      seenUpserts.add(upsert.key);
+    }
+
+    return runTransaction(this.db, () => {
+      const latestRevision = this.db.prepare(
+        `
+          SELECT id
+          FROM workboard_card_events
+          WHERE card_id = ?
+          ORDER BY ordinal DESC
+          LIMIT 1
+        `,
+      );
+      const cardExists = this.db.prepare("SELECT 1 AS present FROM workboard_cards WHERE id = ?");
+      for (const check of mutation.checks) {
+        if (check.expectedAbsent) {
+          if (cardExists.get(check.key)) {
+            return "stale";
+          }
+          continue;
+        }
+        const row = latestRevision.get(check.key) as Row | undefined;
+        if (stringValue(row ?? {}, "id") !== check.expectedRevision) {
+          return "stale";
+        }
+      }
+      for (const upsert of mutation.upserts) {
+        insertCard(this.db, upsert.value.card);
+      }
+      return "updated";
+    });
   }
 
   async lookup(key: string): Promise<PersistedWorkboardCard | undefined> {

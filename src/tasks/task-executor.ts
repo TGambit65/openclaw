@@ -5,6 +5,7 @@ import type {
   DetachedRunningTaskCreateParams,
   DetachedTaskCreateParams,
   DetachedTaskFinalizeParams,
+  DetachedTaskVerifiedWorkboardCompletionParams,
 } from "./detached-task-runtime-contract.js";
 import { getRegisteredDetachedTaskLifecycleRuntime } from "./detached-task-runtime-state.js";
 import {
@@ -17,6 +18,7 @@ import {
   markTaskRunningByRunId,
   finalizeTaskRunByRunId as finalizeTaskRunByRunIdInRegistry,
   recordTaskProgressByRunId,
+  reconcileTaskWithVerifiedWorkboardCompletion as reconcileTaskWithVerifiedWorkboardCompletionInRegistry,
   setTaskRunDeliveryStatusByRunId,
 } from "./runtime-internal.js";
 import {
@@ -188,6 +190,12 @@ export function completeTaskRunByRunId(params: {
 
 export function finalizeTaskRunByRunId(params: DetachedTaskFinalizeParams) {
   return finalizeTaskRunByRunIdInRegistry(params);
+}
+
+export function reconcileVerifiedWorkboardCompletion(
+  params: DetachedTaskVerifiedWorkboardCompletionParams,
+) {
+  return reconcileTaskWithVerifiedWorkboardCompletionInRegistry(params);
 }
 
 export function failTaskRunByRunId(params: {

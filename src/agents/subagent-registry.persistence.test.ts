@@ -5,13 +5,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "./subagent-registry.mocks.shared.js";
 import {
   clearSessionStoreCacheForTest,
   drainSessionStoreWriterQueuesForTest,
 } from "../config/sessions/store.js";
 import { callGateway } from "../gateway/call.js";
 import { onAgentEvent } from "../infra/agent-events.js";
+import { createRunningTaskRun } from "../tasks/detached-task-runtime.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "../tasks/task-flow-registry.js";
+import { resetTaskRegistryForTests } from "../tasks/task-registry.js";
 import { captureEnv, deleteTestEnvValue, setTestEnvValue, withEnv } from "../test-utils/env.js";
 import { persistSubagentSessionTiming } from "./subagent-registry-helpers.js";
 import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
@@ -23,7 +28,10 @@ import {
   getSubagentRunByChildSessionKey,
   initSubagentRegistry,
   listSubagentRunsForRequester,
+  queryWorkboardSubagentRunState,
+  querySubagentRecoveryOwnership,
   registerSubagentRun,
+  requireWorkboardSubagentCompletionDelivery,
   resetSubagentRegistryForTests,
 } from "./subagent-registry.js";
 import {
@@ -37,6 +45,25 @@ import {
   resolveSubagentRegistryPath,
 } from "./subagent-registry.store.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
+
+const registryPersistenceMocks = vi.hoisted(() => ({
+  callGateway: vi.fn(async () => ({
+    status: "ok" as const,
+    startedAt: 111,
+    endedAt: 222,
+  })),
+  getAgentRunContext: vi.fn(() => undefined),
+  onAgentEvent: vi.fn(() => () => undefined),
+}));
+
+vi.mock("../gateway/call.js", () => ({
+  callGateway: registryPersistenceMocks.callGateway,
+}));
+
+vi.mock("../infra/agent-events.js", () => ({
+  getAgentRunContext: registryPersistenceMocks.getAgentRunContext,
+  onAgentEvent: registryPersistenceMocks.onAgentEvent,
+}));
 
 const { announceSpy } = vi.hoisted(() => ({
   announceSpy: vi.fn(async () => true),
@@ -225,6 +252,8 @@ describe("subagent registry persistence", () => {
   afterEach(async () => {
     testing.setDepsForTest();
     resetSubagentRegistryForTests({ persist: false });
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
     await drainSessionStoreWriterQueuesForTest();
     clearSessionStoreCacheForTest();
     if (tempStateDir) {
@@ -430,6 +459,86 @@ describe("subagent registry persistence", () => {
 
     const after = JSON.parse(await fs.readFile(registryPath, "utf8")) as { version?: number };
     expect(after.version).toBe(2);
+  });
+
+  it("restores a pending successor task-generation repair marker", async () => {
+    const runId = "run-pending-task-generation";
+    await writePersistedRegistry(
+      {
+        version: 2,
+        runs: {
+          [runId]: {
+            runId,
+            taskRunId: "run-previous-task-generation",
+            taskGenerationRecovery: {
+              runId,
+              requestedAt: 110,
+              lastAttemptAt: 120,
+              attemptCount: 2,
+              lastError: "task registry unavailable",
+            },
+            childSessionKey: "agent:main:subagent:pending-task-generation",
+            requesterSessionKey: "agent:main:main",
+            requesterDisplayKey: "main",
+            task: "repair this task generation after restart",
+            cleanup: "keep",
+            createdAt: 100,
+            startedAt: 105,
+          },
+        },
+      },
+      { seedChildSessions: false },
+    );
+
+    expect(loadSubagentRegistryFromDisk().get(runId)).toMatchObject({
+      runId,
+      taskRunId: "run-previous-task-generation",
+      taskGenerationRecovery: {
+        runId,
+        requestedAt: 110,
+        lastAttemptAt: 120,
+        attemptCount: 2,
+        lastError: "task registry unavailable",
+      },
+    });
+  });
+
+  it("restores Workboard successor ownership before runtime plugin activation", async () => {
+    const childSessionKey = "agent:main:subagent:workboard-cold-successor";
+    await writePersistedRegistry({
+      version: 2,
+      runs: {
+        "workboard-cold-r3": {
+          runId: "workboard-cold-r3",
+          childSessionKey,
+          requesterSessionKey: "agent:main:main",
+          requesterDisplayKey: "main",
+          task: "continue after two restarts",
+          cleanup: "keep",
+          label: "plugin:workboard",
+          generation: 3,
+          createdAt: 300,
+          startedAt: 300,
+          orphanRecovery: {
+            status: "successor",
+            predecessorRunId: "workboard-cold-r2",
+            rootRunId: "workboard-cold-r1",
+            successorRunId: "workboard-cold-r3",
+            claimedAt: 250,
+            updatedAt: 300,
+            settledAt: 300,
+          },
+        },
+      },
+    });
+    resetSubagentRegistryForTests({ persist: false });
+
+    expect(
+      querySubagentRecoveryOwnership({
+        childSessionKey,
+        predecessorRunId: "workboard-cold-r1",
+      }),
+    ).toEqual({ status: "successor", successorRunId: "workboard-cold-r3" });
   });
 
   it("returns isolated clones for unchanged persisted registry snapshots", async () => {
@@ -660,6 +769,146 @@ describe("subagent registry persistence", () => {
       runs: Record<string, { cleanupCompletedAt?: number }>;
     };
     expect(afterSecond.runs["run-3"].cleanupCompletedAt).toBeGreaterThanOrEqual(beforeRetry);
+  });
+
+  it("restores an armed verified completion and resumes its exact pending payload", async () => {
+    tempStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-subagent-"));
+    setTestEnvValue("OPENCLAW_STATE_DIR", tempStateDir);
+    const runId = "run-verified-restart";
+    const childSessionKey = "agent:main:subagent:verified-restart";
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "workboard",
+      goal: "deliver the exact verified Workboard result",
+      status: "running",
+    });
+    if (!flow) {
+      throw new Error("expected verified restart TaskFlow");
+    }
+    if (
+      !createRunningTaskRun({
+        runtime: "subagent",
+        ownerKey: flow.ownerKey,
+        scopeKind: "session",
+        childSessionKey,
+        runId,
+        parentFlowId: flow.flowId,
+        label: "plugin:workboard",
+        task: "deliver the exact verified Workboard result",
+      })
+    ) {
+      throw new Error("expected verified restart TaskRecord");
+    }
+    await writeChildSessionEntry({
+      sessionKey: childSessionKey,
+      sessionId: "sess-verified-restart",
+    });
+    addSubagentRunForTests({
+      runId,
+      childSessionKey,
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "deliver the exact verified Workboard result",
+      cleanup: "keep",
+      label: "plugin:workboard",
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+    });
+    const requirement = {
+      childSessionKey,
+      runId,
+      obligationId: "workboard:card-verified-restart:completion",
+      cardId: "card-verified-restart",
+      expectedRunId: runId,
+      expectedRevision: "card-revision-4",
+      claimOwnerId: "cairn",
+      summary: "Verified result survived the restart.",
+      completionText: "Verified Workboard result: /tmp/verified-restart.txt",
+      proof: {
+        id: "proof-verified-restart",
+        status: "passed" as const,
+        createdAt: 140,
+        command: "pnpm test",
+      },
+      artifacts: [
+        {
+          id: "artifact-verified-restart",
+          createdAt: 141,
+          path: "/tmp/verified-restart.txt",
+          byteSize: 17,
+          sha256: "c".repeat(64),
+          verifiedAt: 145,
+        },
+      ],
+      createdCardIds: ["child-card-restart"],
+      flowId: flow.flowId,
+      flowOwnerSessionKey: "agent:main:main",
+      flowRevision: 6,
+      controllerId: "workboard" as const,
+    };
+
+    // Keep the first delivery pending, as if the gateway exited after the
+    // registry commit but before the requester acknowledgement returned.
+    announceSpy.mockImplementationOnce(async () => await new Promise<boolean>(() => {}));
+    const armed = requireWorkboardSubagentCompletionDelivery(requirement);
+    expect(armed).toMatchObject({
+      status: "armed",
+      deliveryStatus: "pending",
+      verifiedCompletionIntent: {
+        obligationId: requirement.obligationId,
+        completionText: requirement.completionText,
+        proof: requirement.proof,
+        artifacts: requirement.artifacts,
+      },
+    });
+    expect(announceSpy).toHaveBeenCalledTimes(1);
+
+    const registryPath = path.join(tempStateDir, "subagents", "runs.json");
+    const persisted = await readPersistedRun<SubagentRunRecord>(registryPath, runId);
+    expect(persisted?.delivery).toMatchObject({
+      status: "pending",
+      obligationId: requirement.obligationId,
+      payload: {
+        obligationId: requirement.obligationId,
+        childSessionKey,
+        childRunId: runId,
+        frozenResultText: requirement.completionText,
+      },
+      verifiedWorkboardCompletion: {
+        obligationId: requirement.obligationId,
+        completionText: requirement.completionText,
+        proof: requirement.proof,
+        artifacts: requirement.artifacts,
+      },
+    });
+
+    announceSpy.mockImplementationOnce(async () => await new Promise<boolean>(() => {}));
+    restartRegistry();
+    await waitForRegistryWork(() => announceSpy.mock.calls.length === 2);
+
+    const resumedAnnounceParams = (announceSpy.mock.calls as unknown as Array<[unknown]>)[1]?.[0];
+    expect(resumedAnnounceParams).toMatchObject({
+      childSessionKey,
+      childRunId: runId,
+      deliveryObligationId: requirement.obligationId,
+      roundOneReply: requirement.completionText,
+      outcome: { status: "ok" },
+    });
+    expect(queryWorkboardSubagentRunState({ childSessionKey, runId })).toMatchObject({
+      status: "terminal",
+      outcome: "ok",
+      deliveryStatus: "pending",
+      verifiedCompletionIntent: {
+        obligationId: requirement.obligationId,
+        completionText: requirement.completionText,
+        artifacts: requirement.artifacts,
+      },
+    });
+    expect(getLatestSubagentRunByChildSessionKey(childSessionKey)?.runId).toBe(runId);
+    expect(listSubagentRunsForRequester("agent:main:main")).toHaveLength(1);
   });
 
   it("retries cleanup announce after announce flow rejects", async () => {

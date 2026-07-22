@@ -8,6 +8,7 @@ import type {
   DetachedTaskFinalizeParams,
   DetachedTaskLifecycleRuntime,
   DetachedTaskLifecycleRuntimeRegistration,
+  DetachedTaskVerifiedWorkboardCompletionParams,
 } from "./detached-task-runtime-contract.js";
 import {
   clearDetachedTaskLifecycleRuntimeRegistration,
@@ -23,11 +24,16 @@ import {
   failTaskRunByRunId as failTaskRunByRunIdFromExecutor,
   finalizeTaskRunByRunId as finalizeTaskRunByRunIdFromExecutor,
   recordTaskRunProgressByRunId as recordTaskRunProgressByRunIdFromExecutor,
+  reconcileVerifiedWorkboardCompletion as reconcileVerifiedWorkboardCompletionFromExecutor,
   setDetachedTaskDeliveryStatusByRunId as setDetachedTaskDeliveryStatusByRunIdFromExecutor,
   startTaskRunByRunId as startTaskRunByRunIdFromExecutor,
 } from "./task-executor.js";
 import type { TaskRecord } from "./task-registry.types.js";
-import { findTaskByRunIdForStatus, listTasksForSessionKeyForStatus } from "./task-status-access.js";
+import {
+  findTaskByRunIdForStatus,
+  findTaskByRunIdForStatusStrict,
+  listTasksForSessionKeyForStatus,
+} from "./task-status-access.js";
 
 const log = createSubsystemLogger("tasks/detached-runtime");
 const DETACHED_TASK_RECOVERY_WARN_MS = 5_000;
@@ -58,6 +64,16 @@ function findCoreTaskRun(params: DetachedTaskFindParams): TaskRecord | undefined
   );
 }
 
+function findCoreTaskRunStrict(params: DetachedTaskFindParams): TaskRecord | undefined {
+  const direct = findTaskByRunIdForStatusStrict(params.runId);
+  if (direct && taskMatchesFindIdentity(direct, params)) {
+    return direct;
+  }
+  // Strict existence checks intentionally never use the session fallback. A
+  // fallback cannot prove the exact idempotency run was accepted.
+  return undefined;
+}
+
 export type { DetachedTaskLifecycleRuntime, DetachedTaskLifecycleRuntimeRegistration };
 
 // Default runtime keeps detached task APIs usable before plugins install custom lifecycle hooks.
@@ -67,6 +83,7 @@ const DEFAULT_DETACHED_TASK_LIFECYCLE_RUNTIME: DetachedTaskLifecycleRuntime = {
   startTaskRunByRunId: startTaskRunByRunIdFromExecutor,
   recordTaskRunProgressByRunId: recordTaskRunProgressByRunIdFromExecutor,
   finalizeTaskRunByRunId: finalizeTaskRunByRunIdFromExecutor,
+  reconcileVerifiedWorkboardCompletion: reconcileVerifiedWorkboardCompletionFromExecutor,
   completeTaskRunByRunId: completeTaskRunByRunIdFromExecutor,
   failTaskRunByRunId: failTaskRunByRunIdFromExecutor,
   setDetachedTaskDeliveryStatusByRunId: setDetachedTaskDeliveryStatusByRunIdFromExecutor,
@@ -137,6 +154,13 @@ export function finalizeTaskRunByRunId(params: DetachedTaskFinalizeParams): Task
   });
 }
 
+export function reconcileVerifiedWorkboardCompletion(
+  params: DetachedTaskVerifiedWorkboardCompletionParams,
+): TaskRecord | null {
+  const runtime = getDetachedTaskLifecycleRuntime();
+  return runtime.reconcileVerifiedWorkboardCompletion?.(params) ?? null;
+}
+
 export function completeTaskRunByRunId(
   ...args: Parameters<DetachedTaskLifecycleRuntime["completeTaskRunByRunId"]>
 ): ReturnType<DetachedTaskLifecycleRuntime["completeTaskRunByRunId"]> {
@@ -172,6 +196,19 @@ export function findDetachedTaskRun(params: DetachedTaskFindParams): DetachedTas
   const coreTask = findCoreTaskRun(params);
   // Older custom runtimes may mirror records into core. When they do not, an
   // empty fallback cannot prove that the runtime-owned task is absent.
+  return coreTask ? { lookup: "available", task: coreTask } : { lookup: "unavailable" };
+}
+
+/** Exact detached-task lookup that preserves store/runtime failures. */
+export function findDetachedTaskRunStrict(params: DetachedTaskFindParams): DetachedTaskFindResult {
+  const runtime = getDetachedTaskLifecycleRuntime();
+  if (runtime === DEFAULT_DETACHED_TASK_LIFECYCLE_RUNTIME) {
+    return { lookup: "available", task: findCoreTaskRunStrict(params) };
+  }
+  if (runtime.findTaskRun) {
+    return { lookup: "available", task: runtime.findTaskRun(params) };
+  }
+  const coreTask = findCoreTaskRunStrict(params);
   return coreTask ? { lookup: "available", task: coreTask } : { lookup: "unavailable" };
 }
 

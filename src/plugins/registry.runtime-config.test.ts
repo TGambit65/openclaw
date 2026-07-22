@@ -199,4 +199,79 @@ describe("plugin registry runtime config scope", () => {
       pluginSource: "/plugins/google-meet/index.js",
     });
   });
+
+  it("exposes managed subagent recovery and delivery helpers with the owning plugin scope", async () => {
+    const scopes: Array<string | undefined> = [];
+    const captureScope = () => {
+      scopes.push(getPluginRuntimeGatewayRequestScope()?.pluginId);
+    };
+    const runtime = createPluginRuntime();
+    const resolveOwnerSession = vi.fn(async () => {
+      captureScope();
+      return { status: "unknown" } as const;
+    });
+    const getRecoveryOwnership = vi.fn(async () => {
+      captureScope();
+      return { status: "unknown" } as const;
+    });
+    const getRunState = vi.fn(async () => {
+      captureScope();
+      return { status: "unknown" } as const;
+    });
+    const requireCompletionDelivery = vi.fn(async () => {
+      captureScope();
+      return { status: "unknown" } as const;
+    });
+    runtime.subagent = {
+      ...runtime.subagent,
+      resolveOwnerSession,
+      getRecoveryOwnership,
+      getRunState,
+      requireCompletionDelivery,
+    };
+    const pluginRegistry = createTestRegistry(runtime);
+    const record = createPluginRecord({
+      id: "workboard",
+      name: "Workboard",
+      source: "/plugins/workboard/index.js",
+      origin: "bundled",
+      enabled: true,
+      configSchema: false,
+    });
+    const api = pluginRegistry.createApi(record, { config: {} as OpenClawConfig });
+    const ownerParams = { sessionKey: "agent:main:main" };
+    const runParams = { ...ownerParams, runId: "run-1" };
+    const deliveryParams = {
+      ...runParams,
+      idempotencyKey: "completion-1",
+      cardId: "card-1",
+      expectedRunId: "run-1",
+      expectedRevision: "revision-1",
+      claimOwnerId: "controller-1",
+      summary: "Completed",
+      completionText: "Completed with verified evidence.",
+      proof: {
+        id: "proof-1",
+        status: "passed" as const,
+        createdAt: 1,
+      },
+      artifacts: [],
+      createdCardIds: [],
+      flowId: "flow-1",
+      flowOwnerSessionKey: "agent:main:main",
+      flowRevision: 2,
+      controllerId: "workboard" as const,
+    };
+
+    await api.runtime.subagent.resolveOwnerSession(ownerParams);
+    await api.runtime.subagent.getRecoveryOwnership(runParams);
+    await api.runtime.subagent.getRunState(runParams);
+    await api.runtime.subagent.requireCompletionDelivery(deliveryParams);
+
+    expect(resolveOwnerSession).toHaveBeenCalledWith(ownerParams);
+    expect(getRecoveryOwnership).toHaveBeenCalledWith(runParams);
+    expect(getRunState).toHaveBeenCalledWith(runParams);
+    expect(requireCompletionDelivery).toHaveBeenCalledWith(deliveryParams);
+    expect(scopes).toEqual(["workboard", "workboard", "workboard", "workboard"]);
+  });
 });

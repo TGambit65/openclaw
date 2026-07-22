@@ -192,6 +192,10 @@ export const AgentParamsSchema = Type.Object(
     replyTo: Type.Optional(Type.String()),
     sessionId: Type.Optional(Type.String()),
     sessionKey: Type.Optional(Type.String()),
+    // Trusted Workboard runtimes use this all-or-nothing pair to durably bind
+    // a plugin-owned subagent generation to its managed TaskFlow.
+    parentFlowId: Type.Optional(NonEmptyString),
+    flowOwnerSessionKey: Type.Optional(NonEmptyString),
     thinking: Type.Optional(Type.String()),
     deliver: Type.Optional(Type.Boolean()),
     attachments: Type.Optional(Type.Array(Type.Unknown())),

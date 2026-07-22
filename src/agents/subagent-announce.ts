@@ -19,6 +19,7 @@ import { type DeliveryContext, normalizeDeliveryContext } from "../utils/deliver
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel.js";
 import {
   buildAnnounceIdFromChildRun,
+  buildAnnounceIdFromCompletionObligation,
   buildAnnounceIdempotencyKey,
 } from "./announce-idempotency.js";
 import { formatAgentInternalEventsForPrompt, type AgentInternalEvent } from "./internal-events.js";
@@ -237,6 +238,8 @@ async function wakeSubagentRunAfterDescendants(params: {
 export async function runSubagentAnnounceFlow(params: {
   childSessionKey: string;
   childRunId: string;
+  /** Stable core-owned identity for a verified completion payload. */
+  deliveryObligationId?: string;
   requesterSessionKey: string;
   requesterOrigin?: DeliveryContext;
   requesterDisplayKey: string;
@@ -363,10 +366,16 @@ export async function runSubagentAnnounceFlow(params: {
       // Best-effort only.
     }
 
-    const announceId = buildAnnounceIdFromChildRun({
-      childSessionKey: params.childSessionKey,
-      childRunId: params.childRunId,
-    });
+    const announceId = params.deliveryObligationId?.trim()
+      ? buildAnnounceIdFromCompletionObligation({
+          childSessionKey: params.childSessionKey,
+          childRunId: params.childRunId,
+          obligationId: params.deliveryObligationId.trim(),
+        })
+      : buildAnnounceIdFromChildRun({
+          childSessionKey: params.childSessionKey,
+          childRunId: params.childRunId,
+        });
 
     const childRunAlreadyWoken = isWakeContinuationRun(params.childRunId);
     if (

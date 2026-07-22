@@ -7,6 +7,7 @@ import {
   createManagedTaskFlow as createManagedTaskFlowOrNull,
   deleteTaskFlowRecordById,
   failFlow,
+  finishFlow,
   getTaskFlowById,
   listTaskFlowRecords,
   requestFlowCancel,
@@ -203,6 +204,64 @@ describe("task-flow-registry", () => {
           },
         }),
       ).toThrow("Managed flow controllerId is required.");
+    });
+  });
+
+  it("atomically gives verified completion precedence only over a later cancellation", async () => {
+    await withFlowRegistryTempDir(async () => {
+      const armedFirst = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "workboard",
+        goal: "completion wins after it is armed",
+        status: "running",
+      });
+      const laterCancel = requestFlowCancel({
+        flowId: armedFirst.flowId,
+        expectedRevision: armedFirst.revision,
+        cancelRequestedAt: 200,
+      });
+      expect(laterCancel.applied).toBe(true);
+      if (!laterCancel.applied) {
+        throw new Error("expected later cancellation request to persist");
+      }
+      const completionWins = finishFlow({
+        flowId: armedFirst.flowId,
+        expectedRevision: laterCancel.flow.revision,
+        completionAcceptedAt: 100,
+        endedAt: 300,
+      });
+      expect(completionWins).toMatchObject({
+        applied: true,
+        flow: { status: "succeeded", endedAt: 300 },
+      });
+      if (!completionWins.applied) {
+        throw new Error("expected armed completion to win over later cancellation");
+      }
+      expect(completionWins.flow.cancelRequestedAt).toBeUndefined();
+
+      const cancelledFirst = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "workboard",
+        goal: "cancellation wins before completion is armed",
+        status: "cancelled",
+        cancelRequestedAt: 100,
+        endedAt: 100,
+      });
+      const completionLoses = finishFlow({
+        flowId: cancelledFirst.flowId,
+        expectedRevision: cancelledFirst.revision,
+        completionAcceptedAt: 200,
+        endedAt: 300,
+      });
+      expect(completionLoses).toMatchObject({
+        applied: false,
+        reason: "completion_cancel_conflict",
+        current: { status: "cancelled", cancelRequestedAt: 100 },
+      });
+      expect(getTaskFlowById(cancelledFirst.flowId)).toMatchObject({
+        status: "cancelled",
+        cancelRequestedAt: 100,
+      });
     });
   });
 

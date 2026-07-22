@@ -223,6 +223,14 @@ describe("waitForAgentRun", () => {
     expect(isRecoverableAgentWaitError(result.error)).toBe(true);
   });
 
+  it.each([
+    "gateway closed (1012): service restart",
+    "Error: codex app-server client closed before turn completed",
+    "codex app-server turn route closed before turn completed",
+  ])("classifies exact restart interruption as recoverable: %s", (error) => {
+    expect(isRecoverableAgentWaitError(error)).toBe(true);
+  });
+
   it("preserves pending agent.wait status", async () => {
     callGatewayMock.mockResolvedValue({ status: "pending" });
 

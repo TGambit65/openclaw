@@ -779,6 +779,165 @@ describe("loadGatewayPlugins", () => {
     });
   });
 
+  test("exposes exact recovery and completion delivery only to Workboard scope", async () => {
+    const runtime = await createSubagentRuntime(serverPluginsModule);
+    const registry = await import("../agents/subagent-registry.js");
+    const ownership = vi
+      .spyOn(registry, "querySubagentRecoveryOwnership")
+      .mockReturnValue({ status: "successor", successorRunId: "run-r2" });
+    const runState = vi
+      .spyOn(registry, "queryWorkboardSubagentRunState")
+      .mockReturnValue({ status: "terminal", outcome: "error", error: "worker failed" });
+    const completionParams = {
+      sessionKey: "session-a",
+      runId: "run-r2",
+      idempotencyKey: "workboard:card-a:completion",
+      cardId: "card-a",
+      expectedRunId: "run-r2",
+      expectedRevision: "revision-a",
+      claimOwnerId: "cairn",
+      summary: "verified",
+      completionText: "verified result",
+      proof: { id: "proof-a", status: "passed" as const, createdAt: 1 },
+      artifacts: [
+        {
+          id: "artifact-a",
+          createdAt: 1,
+          path: "/tmp/result.txt",
+          byteSize: 1,
+          sha256: "a".repeat(64),
+          verifiedAt: 2,
+        },
+      ],
+      createdCardIds: [],
+      flowId: "flow-a",
+      flowOwnerSessionKey: "agent:main:main",
+      flowRevision: 2,
+      controllerId: "workboard" as const,
+    };
+    const verifiedCompletionIntent = {
+      kind: "verified_workboard_completion" as const,
+      obligationId: completionParams.idempotencyKey,
+      payloadHash: "b".repeat(64),
+      acceptedAt: 3,
+      cardId: completionParams.cardId,
+      childSessionKey: completionParams.sessionKey,
+      runId: completionParams.runId,
+      expectedRunId: completionParams.expectedRunId,
+      expectedRevision: completionParams.expectedRevision,
+      claimOwnerId: completionParams.claimOwnerId,
+      summary: completionParams.summary,
+      completionText: completionParams.completionText,
+      proof: completionParams.proof,
+      artifacts: completionParams.artifacts,
+      createdCardIds: completionParams.createdCardIds,
+      flowId: completionParams.flowId,
+      flowOwnerSessionKey: completionParams.flowOwnerSessionKey,
+      requesterSessionKey: "agent:main:telegram:direct:kelly",
+      requesterOrigin: { channel: "telegram", to: "kelly" },
+      flowRevision: completionParams.flowRevision,
+      controllerId: completionParams.controllerId,
+    };
+    const completionDelivery = vi
+      .spyOn(registry, "requireWorkboardSubagentCompletionDelivery")
+      .mockReturnValue({
+        status: "armed",
+        deliveryStatus: "pending",
+        verifiedCompletionIntent,
+      });
+    try {
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("demo", () =>
+          runtime.getRecoveryOwnership({ sessionKey: "session-a", runId: "run-r1" }),
+        ),
+      ).resolves.toEqual({ status: "unknown" });
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("demo", () =>
+          runtime.getRunState({ sessionKey: "session-a", runId: "run-r2" }),
+        ),
+      ).resolves.toEqual({ status: "unknown" });
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("demo", () =>
+          runtime.requireCompletionDelivery(completionParams),
+        ),
+      ).resolves.toEqual({ status: "unknown" });
+      expect(ownership).not.toHaveBeenCalled();
+      expect(runState).not.toHaveBeenCalled();
+      expect(completionDelivery).not.toHaveBeenCalled();
+
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("workboard", () =>
+          runtime.getRecoveryOwnership({ sessionKey: "session-a", runId: "run-r1" }),
+        ),
+      ).resolves.toEqual({ status: "successor", successorRunId: "run-r2" });
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("workboard", () =>
+          runtime.getRunState({ sessionKey: "session-a", runId: "run-r2" }),
+        ),
+      ).resolves.toEqual({ status: "terminal", outcome: "error", error: "worker failed" });
+      await expect(
+        gatewayRequestScopeModule.withPluginRuntimePluginIdScope("workboard", () =>
+          runtime.requireCompletionDelivery(completionParams),
+        ),
+      ).resolves.toEqual({
+        status: "armed",
+        deliveryStatus: "pending",
+        verifiedCompletionIntent,
+      });
+      expect(ownership).toHaveBeenCalledWith({
+        childSessionKey: "session-a",
+        predecessorRunId: "run-r1",
+      });
+      expect(runState).toHaveBeenCalledWith({ childSessionKey: "session-a", runId: "run-r2" });
+      expect(completionDelivery).toHaveBeenCalledWith({
+        childSessionKey: completionParams.sessionKey,
+        runId: completionParams.runId,
+        obligationId: completionParams.idempotencyKey,
+        cardId: completionParams.cardId,
+        expectedRunId: completionParams.expectedRunId,
+        expectedRevision: completionParams.expectedRevision,
+        claimOwnerId: completionParams.claimOwnerId,
+        summary: completionParams.summary,
+        completionText: completionParams.completionText,
+        proof: completionParams.proof,
+        artifacts: completionParams.artifacts,
+        createdCardIds: completionParams.createdCardIds,
+        flowId: completionParams.flowId,
+        flowOwnerSessionKey: completionParams.flowOwnerSessionKey,
+        flowRevision: completionParams.flowRevision,
+        controllerId: "workboard",
+      });
+    } finally {
+      ownership.mockRestore();
+      runState.mockRestore();
+      completionDelivery.mockRestore();
+    }
+  });
+
+  test("resolves canonical worker and global owner session identity only for Workboard", async () => {
+    const runtime = await createSubagentRuntime(serverPluginsModule, {
+      session: { scope: "global", mainKey: "main" },
+      agents: { list: [{ id: "work", default: true, workspace: "/tmp/work-workspace" }] },
+    });
+
+    await expect(
+      gatewayRequestScopeModule.withPluginRuntimePluginIdScope("demo", () =>
+        runtime.resolveOwnerSession({ sessionKey: "subagent:workboard:card-a" }),
+      ),
+    ).resolves.toEqual({ status: "unknown" });
+
+    await expect(
+      gatewayRequestScopeModule.withPluginRuntimePluginIdScope("workboard", () =>
+        runtime.resolveOwnerSession({ sessionKey: "subagent:workboard:card-a" }),
+      ),
+    ).resolves.toEqual({
+      status: "resolved",
+      workerSessionKey: "agent:work:subagent:workboard:card-a",
+      ownerSessionKey: "global",
+      workspaceDir: "/tmp/work-workspace",
+    });
+  });
+
   test("times out while waiting for the first in-process gateway response", async () => {
     serverPluginsModule.setFallbackGatewayContext(createTestContext("initial-response-timeout"));
     handleGatewayRequest.mockImplementationOnce(async () => {
@@ -1111,6 +1270,48 @@ describe("loadGatewayPlugins", () => {
 
     expect(getRequiredLastDispatchedParams().cwd).toBe("/tmp/managed-worktree");
     expect(getLastDispatchedClientInternal().pluginRuntimeOwnerId).toBe("workboard");
+  });
+
+  test("forwards paired managed-flow linkage only for Workboard-owned runs", async () => {
+    const runtime = await createSubagentRuntime(serverPluginsModule);
+    serverPluginsModule.setFallbackGatewayContext(createTestContext("managed-flow-forward"));
+
+    await gatewayRequestScopeModule.withPluginRuntimePluginScope(
+      { pluginId: "workboard", pluginOrigin: "bundled" },
+      () =>
+        runtime.run({
+          sessionKey: "agent:main:subagent:managed-flow",
+          message: "hello",
+          parentFlowId: "flow-a",
+          flowOwnerSessionKey: "agent:main:telegram:direct:kelly",
+        }),
+    );
+
+    expect(getRequiredLastDispatchedParams()).toMatchObject({
+      parentFlowId: "flow-a",
+      flowOwnerSessionKey: "agent:main:telegram:direct:kelly",
+    });
+
+    await expect(
+      gatewayRequestScopeModule.withPluginRuntimePluginIdScope("demo", () =>
+        runtime.run({
+          sessionKey: "agent:main:subagent:managed-flow",
+          message: "hello",
+          parentFlowId: "flow-a",
+          flowOwnerSessionKey: "agent:main:main",
+        }),
+      ),
+    ).rejects.toThrow("managed-flow linkage is reserved for Workboard");
+
+    await expect(
+      gatewayRequestScopeModule.withPluginRuntimePluginIdScope("workboard", () =>
+        runtime.run({
+          sessionKey: "agent:main:subagent:managed-flow",
+          message: "hello",
+          parentFlowId: "flow-a",
+        }),
+      ),
+    ).rejects.toThrow("parentFlowId and flowOwnerSessionKey must be provided together");
   });
 
   test("forwards lightContext as lightweight bootstrap context on subagent run", async () => {

@@ -160,6 +160,33 @@ describe("main-session-restart-recovery", () => {
     ]);
   });
 
+  it("excludes marked heartbeat-isolated rows from in-process restart marking only by metadata", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:isolated-heartbeat": {
+        sessionId: "isolated-heartbeat-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        heartbeatIsolatedBaseSessionKey: "  agent:main:main  ",
+      },
+      "agent:main:user:heartbeat": {
+        sessionId: "real-user-heartbeat-suffix",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+      },
+    });
+
+    const result = await markRestartAbortedMainSessions({
+      stateDir: tmpDir,
+      sessionKeys: ["agent:main:isolated-heartbeat", "agent:main:user:heartbeat"],
+    });
+
+    const store = loadSessionStore(path.join(sessionsDir, "sessions.json"));
+    expect(result).toEqual({ marked: 1, skipped: 1 });
+    expect(store["agent:main:isolated-heartbeat"]?.abortedLastRun).toBeUndefined();
+    expect(store["agent:main:user:heartbeat"]?.abortedLastRun).toBe(true);
+  });
+
   it("marks active sessions in a configured custom session store", async () => {
     const storePath = path.join(tmpDir, "custom", "sessions.json");
     await fs.mkdir(path.dirname(storePath), { recursive: true });
@@ -633,6 +660,36 @@ describe("main-session-restart-recovery", () => {
     expect(store["agent:main:main"]?.abortedLastRun).toBe(true);
     expect(store["agent:main:subagent:child"]?.abortedLastRun).toBeUndefined();
     expect(store["agent:main:other"]?.abortedLastRun).toBeUndefined();
+  });
+
+  it("excludes heartbeat-isolated rows from stale-lock recovery without suffix heuristics", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:isolated-heartbeat": {
+        sessionId: "isolated-heartbeat-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        heartbeatIsolatedBaseSessionKey: "agent:main:main",
+      },
+      "agent:main:user:heartbeat": {
+        sessionId: "real-user-heartbeat-suffix",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+      },
+    });
+
+    const result = await markRestartAbortedMainSessionsFromLocks({
+      sessionsDir,
+      cleanedLocks: [
+        cleanedLock(sessionsDir, "isolated-heartbeat-session"),
+        cleanedLock(sessionsDir, "real-user-heartbeat-suffix"),
+      ],
+    });
+
+    const store = loadSessionStore(path.join(sessionsDir, "sessions.json"));
+    expect(result).toEqual({ marked: 1, skipped: 1 });
+    expect(store["agent:main:isolated-heartbeat"]?.abortedLastRun).toBeUndefined();
+    expect(store["agent:main:user:heartbeat"]?.abortedLastRun).toBe(true);
   });
 
   it("marks a running main session whose cleaned transcript lock is topic-suffixed", async () => {
@@ -1113,6 +1170,26 @@ describe("main-session-restart-recovery", () => {
     expect(store["agent:main:recoverable"]?.abortedLastRun).toBe(false);
   });
 
+  it("skips an already restart-marked heartbeat-isolated row without gateway dispatch", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:isolated-heartbeat": {
+        sessionId: "isolated-heartbeat-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        abortedLastRun: true,
+        heartbeatIsolatedBaseSessionKey: "agent:main:main",
+      },
+    });
+
+    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });
+
+    expect(result).toEqual({ recovered: 0, failed: 0, skipped: 1 });
+    expect(callGateway).not.toHaveBeenCalled();
+    const store = readSessionStoreForTest(path.join(sessionsDir, "sessions.json"));
+    expect(store["agent:main:isolated-heartbeat"]?.abortedLastRun).toBe(true);
+  });
+
   it("recovers duplicate-key restart-aborted rows when the active run owns a different session id", async () => {
     const sessionsDir = await makeSessionsDir();
     await writeStore(sessionsDir, {
@@ -1237,6 +1314,50 @@ describe("main-session-restart-recovery", () => {
     expect(store["agent:main:already-marked"]?.abortedLastRun).toBe(false);
   });
 
+  it("skips startup and already-marked heartbeat-isolated rows but recovers a real user heartbeat suffix", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const cutoff = Date.now();
+    await writeStore(sessionsDir, {
+      "agent:main:isolated-startup": {
+        sessionId: "isolated-startup-session",
+        updatedAt: cutoff - 10_000,
+        status: "running",
+        heartbeatIsolatedBaseSessionKey: "\nagent:main:main\t",
+      },
+      "agent:main:isolated-already-marked": {
+        sessionId: "isolated-already-marked-session",
+        updatedAt: cutoff - 10_000,
+        status: "running",
+        abortedLastRun: true,
+        heartbeatIsolatedBaseSessionKey: "agent:main:main",
+      },
+      "agent:main:user:heartbeat": {
+        sessionId: "real-user-heartbeat-suffix",
+        updatedAt: cutoff - 10_000,
+        status: "running",
+      },
+    });
+    await writeTranscript(sessionsDir, "real-user-heartbeat-suffix", [
+      { role: "user", content: "resume this real user session" },
+      { role: "toolResult", content: "done" },
+    ]);
+
+    const result = await recoverStartupOrphanedMainSessions({
+      stateDir: tmpDir,
+      activeSessionIds: [],
+      activeSessionKeys: [],
+      updatedBeforeMs: cutoff,
+    });
+
+    expect(result).toEqual({ marked: 1, recovered: 1, failed: 0, skipped: 2 });
+    expect(callGateway).toHaveBeenCalledOnce();
+    expect(firstGatewayParams().sessionKey).toBe("agent:main:user:heartbeat");
+    const store = readSessionStoreForTest(path.join(sessionsDir, "sessions.json"));
+    expect(store["agent:main:isolated-startup"]?.abortedLastRun).toBeUndefined();
+    expect(store["agent:main:isolated-already-marked"]?.abortedLastRun).toBe(true);
+    expect(store["agent:main:user:heartbeat"]?.abortedLastRun).toBe(false);
+  });
+
   it("recovers only the configured store for duplicate startup-orphaned session keys", async () => {
     const cutoff = Date.now();
     const defaultSessionsDir = await makeSessionsDir();
@@ -1297,7 +1418,10 @@ describe("main-session-restart-recovery", () => {
       { role: "assistant", content: "partial answer" },
     ]);
 
-    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });
+    const result = await recoverRestartAbortedMainSessions({
+      stateDir: tmpDir,
+      hasDurableCompletionOwner: () => false,
+    });
 
     expect(result).toEqual({ recovered: 0, failed: 1, skipped: 0 });
     expect(callGateway).not.toHaveBeenCalled();
@@ -1325,7 +1449,10 @@ describe("main-session-restart-recovery", () => {
       { role: "assistant", content: "partial answer" },
     ]);
 
-    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });
+    const result = await recoverRestartAbortedMainSessions({
+      stateDir: tmpDir,
+      hasDurableCompletionOwner: () => false,
+    });
 
     expect(result).toEqual({ recovered: 0, failed: 1, skipped: 0 });
     expect(callGateway).toHaveBeenCalledOnce();
@@ -1352,5 +1479,37 @@ describe("main-session-restart-recovery", () => {
     const store = loadSessionStore(path.join(sessionsDir, "sessions.json"));
     expect(store["agent:main:demo-channel:room-1"]?.status).toBe("failed");
     expect(store["agent:main:demo-channel:room-1"]?.abortedLastRun).toBe(true);
+  });
+
+  it("suppresses only the generic notice when durable Workboard delivery owns the requester", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const sessionKey = "agent:main:telegram:direct:kelly";
+    await writeStore(sessionsDir, {
+      [sessionKey]: {
+        sessionId: "workboard-owner-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        abortedLastRun: true,
+        lastChannel: "telegram",
+        lastTo: "telegram:kelly",
+        lastAccountId: "default",
+      },
+    });
+    await writeTranscript(sessionsDir, "workboard-owner-session", [
+      { role: "user", content: "run the durable Workboard workflow" },
+      { role: "assistant", content: "partial parent answer before restart" },
+    ]);
+    const hasDurableCompletionOwner = vi.fn(async (candidate: string) => candidate === sessionKey);
+
+    const result = await recoverRestartAbortedMainSessions({
+      stateDir: tmpDir,
+      hasDurableCompletionOwner,
+    });
+
+    expect(result).toEqual({ recovered: 0, failed: 1, skipped: 0 });
+    expect(hasDurableCompletionOwner).toHaveBeenCalledWith(sessionKey);
+    expect(callGateway).not.toHaveBeenCalled();
+    const store = loadSessionStore(path.join(sessionsDir, "sessions.json"));
+    expect(store[sessionKey]).toMatchObject({ status: "failed", abortedLastRun: true });
   });
 });
