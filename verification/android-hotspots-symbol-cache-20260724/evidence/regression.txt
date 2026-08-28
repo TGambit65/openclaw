@@ -1,0 +1,11 @@
+Regression evidence
+
+The primary Simpleperf fixture sets OPENCLAW_REQUIRE_REPORT_SYMFS=1. Its fake host reporter rejects any report whose --symfs argument is not the current capture's $PWD/binary_cache or whose cache lacks fake.so.
+
+All three production report calls now include:
+  --symfs "$binary_cache_dir"
+
+The negative fixture sets OPENCLAW_FAKE_SKIP_BINARY_CACHE=1 and verifies:
+  simpleperf capture did not produce the binary cache required for symbolized reports
+
+It also verifies that no destination perf.data is published.

@@ -21,6 +21,60 @@ title: "Android App"
 
 System control (launchd/systemd) lives on the Gateway host. See [Gateway](/gateway).
 
+## Source Checkout Tooling
+
+From a source checkout, Android install/run wrappers live at the repo root:
+
+```bash
+pnpm android:install
+pnpm android:run
+```
+
+The wrappers auto-select a single connected `adb` device and fail closed when multiple devices are attached. To target one device:
+
+```bash
+ANDROID_SERIAL=<adb-serial> pnpm android:install
+ANDROID_SERIAL=<adb-serial> pnpm android:run
+pnpm android:install -- --serial <adb-serial>
+pnpm android:run -- --serial <adb-serial>
+```
+
+For `pnpm android:run` custom package/activity targets, pass `--no-install` when the target is already installed, or `--task <gradle-install-task-path>` when the wrapper should install that target before launch. Activity names can be package-relative (`.MainActivity`), bare (`MainActivity`, normalized to `.MainActivity`), or fully qualified (`com.example.MainActivity`). Custom task values must be Gradle install task paths whose final task segment starts with `install`, such as `:app:installDebug` or `:benchmark:installDebug`.
+
+The helper scripts and repo-root Android scripts set `ANDROID_SDK_ROOT` / `ANDROID_HOME` from existing env, `apps/android/local.properties`, or common SDK locations (`~/Android/Sdk` on Linux and `~/Library/Android/sdk` on macOS). Gradle-backed helper scripts fail early with that discovery checklist when no SDK is found; direct `gradlew` invocations still need one of those env vars or `local.properties`.
+
+Low-noise startup perf tools live in `apps/android/scripts/`:
+
+```bash
+cd apps/android
+./scripts/perf-startup-benchmark.sh
+./scripts/perf-startup-hotspots.sh
+```
+
+The same tools are available from the repo root:
+
+```bash
+pnpm android:perf:startup
+pnpm android:perf:hotspots
+pnpm android:perf:startup -- --serial <adb-serial>
+pnpm android:perf:hotspots -- --serial <adb-serial>
+pnpm android:perf:startup -- --baseline apps/android/benchmark/results/startup-<timestamp>.<suffix>.json
+pnpm android:perf:hotspots -- --duration 5 --out /tmp/openclaw-startup.perf.data
+# legacy app_profiler.py releases only:
+pnpm android:perf:hotspots -- --arch arm64
+pnpm android:perf:hotspots -- --package <pkg> --activity <activity> --no-install
+pnpm android:perf:hotspots -- --package <pkg> --activity <activity> --install-task <gradle-task-path>
+```
+
+When using the `pnpm android:*` wrappers, path arguments such as `--baseline` and `--out` are resolved from the repo root.
+
+Both perf scripts require `adb` and a connected device:
+
+- `perf-startup-benchmark.sh` also requires `jq`, writes local git-ignored timestamped snapshots under `apps/android/benchmark/results/` (or `ANDROID_BENCHMARK_RESULTS_DIR`), and compares only against compatible local snapshots from the same device brand, model, SDK, and OS build fingerprint unless `--baseline <benchmarkData.json>` is passed explicitly. Before calculating a delta, it verifies the selected baseline's median against its 10 raw runs.
+- `perf-startup-hotspots.sh` requires `uv` and a complete Android NDK `simpleperf` bundle with `app_profiler.py` plus the bundled host report binary, discovered through `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` (NDK root or direct `simpleperf` dir), `ndk.dir` in `apps/android/local.properties`, SDK roots (`ANDROID_SDK_ROOT` / `ANDROID_HOME`), or common home SDK locations (`~/Android/Sdk`, `~/Library/Android/sdk`). It detects and supports both the current activity-launch interface and the legacy `--profile_from_launch` interface, starts Simpleperf before launching the target activity, and refuses to invoke it when the selected `adb` daemon is already root because upstream `--disable_adb_root` would otherwise run `adb unroot`. On the normal `shell` daemon path, it passes `--disable_adb_root` and avoids changing the app's compilation mode. Because legacy releases also set `security.perf_harden=0`, the wrapper snapshots, restores, and verifies the original property value before publishing a capture, while refusing to overwrite an unexpected concurrent property change. Legacy releases use package/device ABI detection and accept `--arch arm|arm64|x86|x86_64`; current releases select the device architecture automatically and reject `--arch`. The script invokes the bundled host report binary directly so older `report.py` wrappers do not add a Tk dependency, normalizes text-only and CSV reporter generations into one validated summary path, prints the selected interface, NDK and reporter paths plus capture duration, keeps Simpleperf's transient `binary_cache/` in per-run scratch space, requires and passes that cache to every report via `--symfs`, and fails closed when the reporter returns empty or malformed self-time/children output.
+- `perf-startup-hotspots.sh` installs the OpenClaw debug app by default. Use `--duration <seconds>` to adjust the sample window, `--out <perf.data>` to choose the raw capture path, `--no-install` for already-installed custom targets, or `--install-task <gradle-install-task-path>` when profiling a custom package that should be installed first. An unchanged existing regular output file is replaced only after capture produces non-empty validated data; directories, symlinks, special files, and outputs changed during capture are rejected.
+- Custom `--package` values must be Android application IDs with at least two dot-separated segments, custom `--activity` values must be valid Android component names, and custom install task values must be Gradle task paths whose final task segment starts with `install`, such as `:app:installDebug` or `:benchmark:installDebug`.
+
 ## Connection Runbook
 
 Android node app ⇄ (mDNS/NSD + WebSocket) ⇄ **Gateway**

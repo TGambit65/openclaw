@@ -71,7 +71,7 @@ Bonjour 是尽力而为的，不会跨网络。它仅用于"同一 LAN"的便利
   - `gatewayPort=18789`（Gateway 网关 WS + HTTP）
   - `gatewayTls=1`（仅当启用 TLS 时）
   - `gatewayTlsSha256=<sha256>`（仅当启用 TLS 且指纹可用时）
-  - `canvasPort=18793`（默认画布主机端口；服务于 `/__openclaw__/canvas/`）
+  - `canvasPort=<port>`（Canvas 主机端口；启用 Canvas 主机时当前与 `gatewayPort` 相同）
   - `cliPath=<path>`（可选；可运行的 `openclaw` 入口点或二进制文件的绝对路径）
   - `tailnetDns=<magicdns>`（可选提示；当 Tailscale 可用时自动检测）
 

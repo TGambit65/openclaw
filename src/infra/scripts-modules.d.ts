@@ -14,9 +14,15 @@ declare module "../../scripts/watch-node.mjs" {
 }
 
 declare module "../../scripts/ci-changed-scope.mjs" {
-  export function detectChangedScope(paths: string[]): {
+  export type ChangedScope = {
     runNode: boolean;
     runMacos: boolean;
     runAndroid: boolean;
+    runWindows: boolean;
   };
+
+  export function detectChangedScope(paths: string[]): ChangedScope;
+  export function formatChangedScopeOutput(scope: ChangedScope): string;
+  export function listChangedPaths(base: string, head?: string): string[];
+  export function writeGitHubOutput(scope: ChangedScope, outputPath?: string): void;
 }

@@ -468,6 +468,7 @@ Docs: https://docs.openclaw.ai
 ### Changes
 
 - Docs/Contributing: require before/after screenshots for UI or visual PRs in the pre-PR checklist. (#32206) Thanks @hydro13.
+- Android/Perf tooling: add fail-closed source-checkout wrappers for install/run/startup benchmarking/hotspot profiling, including single-device selection, SDK/NDK discovery, current/legacy Simpleperf compatibility, local benchmark snapshots, and CI smoke coverage for the shell tools.
 
 ### Fixes
 

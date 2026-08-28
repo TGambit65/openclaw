@@ -1,0 +1,20 @@
+Verification evidence
+
+Command:
+  pnpm test:android:shell-tools
+
+Result:
+  exit 0
+  android shell tool smoke tests passed
+
+Commands:
+  bash -n apps/android/scripts/perf-startup-hotspots.sh
+  bash -n scripts/test-android-shell-tools.sh
+  git diff --check -- apps/android/scripts/perf-startup-hotspots.sh scripts/test-android-shell-tools.sh apps/android/README.md docs/platforms/android.md
+
+Result:
+  all exited 0 with no diagnostics
+
+Device check:
+  sdk=unavailable
+  adb=unavailable

@@ -43,7 +43,7 @@ pnpm gateway:watch
   - OpenAI Chat Completions（HTTP）：[`/v1/chat/completions`](/gateway/openai-http-api)。
   - OpenResponses（HTTP）：[`/v1/responses`](/gateway/openresponses-http-api)。
   - Tools Invoke（HTTP）：[`/tools/invoke`](/gateway/tools-invoke-http-api)。
-- 默认在 `canvasHost.port`（默认 `18793`）上启动 Canvas 文件服务器，从 `~/.openclaw/workspace/canvas` 提供 `http://<gateway-host>:18793/__openclaw__/canvas/`。使用 `canvasHost.enabled=false` 或 `OPENCLAW_SKIP_CANVAS_HOST=1` 禁用。
+- 默认在 Gateway 网关 HTTP 服务器的同一端口（默认 `18789`）上挂载 Canvas 文件服务器，从 `~/.openclaw/workspace/canvas` 提供 `http://<gateway-host>:18789/__openclaw__/canvas/` 和 `http://<gateway-host>:18789/__openclaw__/a2ui/`。使用 `canvasHost.enabled=false` 或 `OPENCLAW_SKIP_CANVAS_HOST=1` 禁用。
 - 输出日志到 stdout；使用 launchd/systemd 保持运行并轮转日志。
 - 故障排除时传递 `--verbose` 以将调试日志（握手、请求/响应、事件）从日志文件镜像到 stdio。
 - `--force` 使用 `lsof` 查找所选端口上的监听器，发送 SIGTERM，记录它终止了什么，然后启动 Gateway 网关（如果缺少 `lsof` 则快速失败）。
@@ -99,16 +99,7 @@ openclaw --dev health
 - `OPENCLAW_STATE_DIR=~/.openclaw-dev`
 - `OPENCLAW_CONFIG_PATH=~/.openclaw-dev/openclaw.json`
 - `OPENCLAW_GATEWAY_PORT=19001`（Gateway 网关 WS + HTTP）
-- 浏览器控制服务端口 = `19003`（派生：`gateway.port+2`，仅 loopback）
-- `canvasHost.port=19005`（派生：`gateway.port+4`）
 - 当你在 `--dev` 下运行 `setup`/`onboard` 时，`agents.defaults.workspace` 默认变为 `~/.openclaw/workspace-dev`。
-
-派生端口（经验法则）：
-
-- 基础端口 = `gateway.port`（或 `OPENCLAW_GATEWAY_PORT` / `--port`）
-- 浏览器控制服务端口 = 基础 + 2（仅 loopback）
-- `canvasHost.port = 基础 + 4`（或 `OPENCLAW_CANVAS_HOST_PORT` / 配置覆盖）
-- 浏览器配置文件 CDP 端口从 `browser.controlPort + 9 .. + 108` 自动分配（按配置文件持久化）。
 
 每个实例的检查清单：
 

@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   # Detect docs-only changes to skip heavy jobs (test, build, Windows, macOS, Android).
-  # Lint and format always run. Fail-safe: if detection fails, run everything.
+  # Scoped lint/format jobs run when their relevant files changed. Fail-safe: if detection fails, run everything.
   docs-scope:
     runs-on: blacksmith-16vcpu-ubuntu-2404
     outputs:
@@ -29,10 +29,11 @@ jobs:
         uses: ./.github/actions/detect-docs-changes
 
   # Detect which heavy areas are touched so PRs can skip unrelated expensive jobs.
-  # Push to main keeps broad coverage.
+  # Push to main still keeps broad coverage, but this job must complete so
+  # downstream jobs that need its outputs are not blocked by a skipped need.
   changed-scope:
     needs: [docs-scope]
-    if: github.event_name == 'pull_request' && needs.docs-scope.outputs.docs_only != 'true'
+    if: needs.docs-scope.outputs.docs_only != 'true'
     runs-on: blacksmith-16vcpu-ubuntu-2404
     outputs:
       run_node: ${{ steps.scope.outputs.run_node }}
@@ -159,6 +160,46 @@ jobs:
       - name: Run ${{ matrix.task }} (${{ matrix.runtime }})
         if: matrix.runtime != 'bun' || github.event_name != 'push'
         run: ${{ matrix.command }}
+
+  android-shell-tools:
+    needs: [docs-scope, changed-scope]
+    if: needs.docs-scope.outputs.docs_only != 'true' && (github.event_name == 'push' || needs.changed-scope.outputs.run_android == 'true' || needs.changed-scope.outputs.run_node == 'true')
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.x
+          check-latest: false
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm-store-cache
+        with:
+          pnpm-version: "10.23.0"
+          cache-key-suffix: "node22"
+          use-actions-cache: "false"
+          use-restore-keys: "false"
+          use-sticky-disk: "false"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.21"
+          enable-cache: "false"
+
+      - name: Runtime versions
+        run: |
+          node -v
+          pnpm -v
+          uv --version
+
+      - name: Test Android shell tools
+        run: pnpm test:android:shell-tools
 
   # Types, lint, and format check.
   check:
@@ -455,7 +496,7 @@ jobs:
   # running 4 separate jobs per PR (as before) starved the queue. One job
   # per PR allows 5 PRs to run macOS checks simultaneously.
   macos:
-    needs: [docs-scope, changed-scope, check]
+    needs: [docs-scope, changed-scope]
     if: github.event_name == 'pull_request' && needs.docs-scope.outputs.docs_only != 'true' && needs.changed-scope.outputs.run_macos == 'true'
     runs-on: macos-latest
     steps:

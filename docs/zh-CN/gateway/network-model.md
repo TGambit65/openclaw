@@ -19,5 +19,8 @@ x-i18n:
 - 建议每台主机运行一个 Gateway 网关。它是唯一允许拥有 WhatsApp Web 会话的进程。对于救援机器人或严格隔离的场景，可以使用隔离的配置文件和端口运行多个 Gateway 网关。参见[多 Gateway 网关](/gateway/multiple-gateways)。
 - 优先使用回环地址：Gateway 网关的 WS 默认为 `ws://127.0.0.1:18789`。即使是回环连接，向导也会默认生成 gateway token。若需通过 tailnet 访问，请运行 `openclaw gateway --bind tailnet --token ...`，因为非回环绑定必须使用 token。
 - 节点根据需要通过局域网、tailnet 或 SSH 连接到 Gateway 网关的 WS。旧版 TCP 桥接已弃用。
-- Canvas 主机是一个 HTTP 文件服务器，运行在 `canvasHost.port`（默认 `18793`）上，提供 `/__openclaw__/canvas/` 路径供节点 WebView 使用。参见 [Gateway 网关配置](/gateway/configuration)（`canvasHost`）。
+- Canvas 主机由 Gateway 网关 HTTP 服务器在 **同一端口** 提供（默认 `18789`）：
+  - `/__openclaw__/canvas/`
+  - `/__openclaw__/a2ui/`
+    当配置了 `gateway.auth` 且 Gateway 网关绑定到 loopback 以外的地址时，这些路由受 Gateway 网关认证保护。节点客户端使用绑定到当前 WS 会话的节点作用域 capability URL。参见 [Gateway 网关配置](/gateway/configuration)（`canvasHost`、`gateway`）。
 - 远程使用通常通过 SSH 隧道或 Tailscale VPN。参见[远程访问](/gateway/remote)和[设备发现](/gateway/discovery)。

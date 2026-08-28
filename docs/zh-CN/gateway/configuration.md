@@ -3165,19 +3165,24 @@ Tailscale 可以正确代理 `/gmail-pubsub`（它会去除设置的路径前缀
 如果你需要后端接收带前缀的路径，请将
 `hooks.gmail.tailscale.target` 设为完整 URL（并对齐 `serve.path`）。
 
-### `canvasHost`（LAN/tailnet Canvas 文件服务器 + 实时重载）
+### `canvasHost`（Gateway 网关 HTTP Canvas 文件服务器 + 实时重载）
 
 Gateway 网关通过 HTTP 提供 HTML/CSS/JS 目录服务，以便 iOS/Android 节点可以简单地 `canvas.navigate` 到它。
 
 默认根目录：`~/.openclaw/workspace/canvas`
-默认端口：`18793`（选择此端口以避免 OpenClaw 浏览器 CDP 端口 `18792`）
-服务器监听 **Gateway 网关绑定主机**（LAN 或 Tailnet），以便节点可以访问。
+默认端口：Gateway 网关端口（默认 `18789`）
+服务器挂载在 **Gateway 网关 HTTP 服务器** 上：
+
+- `http://<gateway-host>:<gateway.port>/__openclaw__/canvas/`
+- `http://<gateway-host>:<gateway.port>/__openclaw__/a2ui/`
+
+当 Gateway 网关绑定到 loopback 以外的地址时，Canvas/A2UI 路由使用与其他 Gateway 网关 HTTP 表面相同的认证。节点配对并连接后，Gateway 网关会通告绑定到当前节点 WS 会话的节点作用域 capability URL。
 
 服务器：
 
 - 提供 `canvasHost.root` 下的文件
 - 向提供的 HTML 注入微型实时重载客户端
-- 监视目录并通过 `/__openclaw__/ws` 的 WebSocket 端点广播重载
+- 监视目录并通过 Gateway 网关端口上的 `/__openclaw__/ws` 的 WebSocket 端点广播重载
 - 目录为空时自动创建起始 `index.html`（以便你立即看到内容）
 - 同时在 `/__openclaw__/a2ui/` 提供 A2UI，并作为 `canvasHostUrl` 通告给节点
   （节点始终使用它来访问 Canvas/A2UI）
@@ -3190,7 +3195,6 @@ Gateway 网关通过 HTTP 提供 HTML/CSS/JS 目录服务，以便 iOS/Android �
 {
   canvasHost: {
     root: "~/.openclaw/workspace/canvas",
-    port: 18793,
     liveReload: true,
   },
 }
