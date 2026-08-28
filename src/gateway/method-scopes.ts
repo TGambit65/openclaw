@@ -19,7 +19,14 @@ export const CLI_DEFAULT_OPERATOR_SCOPES: OperatorScope[] = [
   PAIRING_SCOPE,
 ];
 
-const NODE_ROLE_METHODS = new Set(["node.invoke.result", "node.event", "skills.bins"]);
+const NODE_ROLE_METHODS = new Set([
+  "node.invoke.result",
+  "node.event",
+  "node.canvas.capability.refresh",
+  "node.pending.pull",
+  "node.pending.ack",
+  "skills.bins",
+]);
 
 const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
   [APPROVALS_SCOPE]: [
@@ -43,6 +50,7 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
   ],
   [READ_SCOPE]: [
     "health",
+    "doctor.memory.status",
     "logs.tail",
     "channels.status",
     "status",
@@ -57,6 +65,7 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
     "skills.status",
     "voicewake.get",
     "sessions.list",
+    "sessions.get",
     "sessions.preview",
     "sessions.resolve",
     "sessions.usage",
@@ -71,6 +80,7 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
     "node.describe",
     "chat.history",
     "config.get",
+    "config.schema.lookup",
     "talk.config",
     "agents.files.list",
     "agents.files.get",
@@ -100,6 +110,8 @@ const METHOD_SCOPE_GROUPS: Record<OperatorScope, readonly string[]> = {
     "agents.delete",
     "skills.install",
     "skills.update",
+    "secrets.reload",
+    "secrets.resolve",
     "cron.add",
     "cron.update",
     "cron.remove",
