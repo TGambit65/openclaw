@@ -1,0 +1,173 @@
+# Salvage of stale PR-review worktree pr-7953 (detached @ 2ccb6f43199, Mar 2026 triage)
+
+diff --git a/apps/android/README.md b/apps/android/README.md
+index 50704e63d0b..c0a07ccb49d 100644
+--- a/apps/android/README.md
++++ b/apps/android/README.md
+@@ -54,7 +54,7 @@ cd apps/android
+ ./gradlew :app:lintDebug
+ ```
+ 
+-`gradlew` auto-detects the Android SDK at `~/Library/Android/sdk` (macOS default) if `ANDROID_SDK_ROOT` / `ANDROID_HOME` are unset.
++If SDK discovery is flaky, export `ANDROID_SDK_ROOT` (or `ANDROID_HOME`) explicitly. Standard installs such as `~/Library/Android/sdk` on macOS and `~/Android/Sdk` on Linux are the usual defaults.
+ 
+ ## Macrobenchmark (Startup + Frame Timing)
+ 
+@@ -83,10 +83,13 @@ Benchmark script behavior:
+ - Prints median/min/max/COV in one line.
+ - Writes timestamped snapshot JSON to `apps/android/benchmark/results/`.
+ - Auto-compares with previous local snapshot (or pass explicit baseline: `--baseline <old-benchmarkData.json>`).
++- Requires exactly one connected adb target to avoid noisy or split benchmark runs.
+ 
+ Hotspot script behavior:
+ 
+ - Ensures debug app installed, captures startup `simpleperf` data for `.MainActivity`.
++- Requires exactly one connected adb target so `installDebug` and capture hit the intended device.
++- Auto-discovers `simpleperf` from `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` or standard macOS/Linux SDK installs when possible.
+ - Prints top DSOs, top symbols, and key app-path clues (Compose/MainActivity/WebView).
+ - Writes raw `perf.data` path for deeper follow-up if needed.
+ 
+diff --git a/apps/android/scripts/perf-startup-benchmark.sh b/apps/android/scripts/perf-startup-benchmark.sh
+index 70342d3cba4..ec6b1975d2c 100755
+--- a/apps/android/scripts/perf-startup-benchmark.sh
++++ b/apps/android/scripts/perf-startup-benchmark.sh
+@@ -18,6 +18,19 @@ If --baseline is omitted, compares against latest previous snapshot when availab
+ EOF
+ }
+ 
++stat_mtime() {
++  local path="$1"
++  if stat --format='%Y' "$path" >/dev/null 2>&1; then
++    stat --format='%Y' "$path"
++  else
++    stat -f '%m' "$path"
++  fi
++}
++
++connected_device_serials() {
++  adb devices | awk 'NR>1 && $2=="device" {print $1}'
++}
++
+ while [[ $# -gt 0 ]]; do
+   case "$1" in
+     --baseline)
+@@ -46,11 +59,17 @@ if ! command -v adb >/dev/null 2>&1; then
+   exit 1
+ fi
+ 
+-device_count="$(adb devices | awk 'NR>1 && $2=="device" {c+=1} END {print c+0}')"
++mapfile -t connected_serials < <(connected_device_serials)
++device_count="${#connected_serials[@]}"
+ if [[ "$device_count" -lt 1 ]]; then
+   echo "No connected Android device (adb state=device)." >&2
+   exit 1
+ fi
++if [[ "$device_count" -gt 1 ]]; then
++  echo "Expected exactly one connected Android device for deterministic macrobenchmark runs, found $device_count: ${connected_serials[*]}" >&2
++  echo "Disconnect extra devices/emulators before running ./scripts/perf-startup-benchmark.sh." >&2
++  exit 1
++fi
+ 
+ mkdir -p "$RESULTS_DIR"
+ 
+@@ -68,7 +87,7 @@ latest_json="$(
+   find "$ANDROID_DIR/benchmark/build/outputs/connected_android_test_additional_output/debug/connected" \
+     -name '*benchmarkData.json' -type f \
+     | while IFS= read -r file; do
+-        printf '%s\t%s\n' "$(stat -f '%m' "$file")" "$file"
++        printf '%s\t%s\n' "$(stat_mtime "$file")" "$file"
+       done \
+     | sort -nr \
+     | head -n1 \
+@@ -104,7 +123,7 @@ if [[ -z "$BASELINE_JSON" ]]; then
+           if [[ "$file" == "$snapshot_json" ]]; then
+             continue
+           fi
+-          printf '%s\t%s\n' "$(stat -f '%m' "$file")" "$file"
++          printf '%s\t%s\n' "$(stat_mtime "$file")" "$file"
+         done \
+       | sort -nr \
+       | head -n1 \
+diff --git a/apps/android/scripts/perf-startup-hotspots.sh b/apps/android/scripts/perf-startup-hotspots.sh
+index 787d5fac300..71b0c73db52 100755
+--- a/apps/android/scripts/perf-startup-hotspots.sh
++++ b/apps/android/scripts/perf-startup-hotspots.sh
+@@ -19,6 +19,42 @@ Default package/activity target OpenClaw Android startup.
+ EOF
+ }
+ 
++find_simpleperf_dir() {
++  if [[ -n "${ANDROID_NDK_HOME:-}" && -f "${ANDROID_NDK_HOME}/simpleperf/app_profiler.py" ]]; then
++    printf '%s\n' "${ANDROID_NDK_HOME}/simpleperf"
++    return 0
++  fi
++
++  if [[ -n "${ANDROID_NDK_ROOT:-}" && -f "${ANDROID_NDK_ROOT}/simpleperf/app_profiler.py" ]]; then
++    printf '%s\n' "${ANDROID_NDK_ROOT}/simpleperf"
++    return 0
++  fi
++
++  local sdk_roots=()
++  [[ -n "${ANDROID_SDK_ROOT:-}" ]] && sdk_roots+=("${ANDROID_SDK_ROOT}")
++  [[ -n "${ANDROID_HOME:-}" ]] && sdk_roots+=("${ANDROID_HOME}")
++  sdk_roots+=("${HOME}/Library/Android/sdk" "${HOME}/Android/Sdk")
++
++  local candidates=()
++  local sdk_root dir
++  for sdk_root in "${sdk_roots[@]}"; do
++    while IFS= read -r dir; do
++      [[ -f "$dir/app_profiler.py" ]] && candidates+=("$dir")
++    done < <(ls -d "$sdk_root"/ndk/*/simpleperf 2>/dev/null || true)
++  done
++
++  if [[ ${#candidates[@]} -gt 0 ]]; then
++    printf '%s\n' "${candidates[@]}" | sort | tail -n1
++    return 0
++  fi
++
++  return 1
++}
++
++connected_device_serials() {
++  adb devices | awk 'NR>1 && $2=="device" {print $1}'
++}
++
+ while [[ $# -gt 0 ]]; do
+   case "$1" in
+     --package)
+@@ -63,26 +99,22 @@ if [[ -z "$OUTPUT_PERF_DATA" ]]; then
+   OUTPUT_PERF_DATA="/tmp/openclaw-startup-$(date +%Y%m%d-%H%M%S).perf.data"
+ fi
+ 
+-device_count="$(adb devices | awk 'NR>1 && $2=="device" {c+=1} END {print c+0}')"
++mapfile -t connected_serials < <(connected_device_serials)
++device_count="${#connected_serials[@]}"
+ if [[ "$device_count" -lt 1 ]]; then
+   echo "No connected Android device (adb state=device)." >&2
+   exit 1
+ fi
+-
+-simpleperf_dir=""
+-if [[ -n "${ANDROID_NDK_HOME:-}" && -f "${ANDROID_NDK_HOME}/simpleperf/app_profiler.py" ]]; then
+-  simpleperf_dir="${ANDROID_NDK_HOME}/simpleperf"
+-elif [[ -n "${ANDROID_NDK_ROOT:-}" && -f "${ANDROID_NDK_ROOT}/simpleperf/app_profiler.py" ]]; then
+-  simpleperf_dir="${ANDROID_NDK_ROOT}/simpleperf"
+-else
+-  latest_simpleperf="$(ls -d "${HOME}/Library/Android/sdk/ndk/"*/simpleperf 2>/dev/null | sort -V | tail -n1 || true)"
+-  if [[ -n "$latest_simpleperf" && -f "$latest_simpleperf/app_profiler.py" ]]; then
+-    simpleperf_dir="$latest_simpleperf"
+-  fi
++if [[ "$device_count" -gt 1 ]]; then
++  echo "Expected exactly one connected Android device for hotspot capture, found $device_count: ${connected_serials[*]}" >&2
++  echo "Disconnect extra devices/emulators before running ./scripts/perf-startup-hotspots.sh." >&2
++  exit 1
+ fi
+ 
++simpleperf_dir="$(find_simpleperf_dir || true)"
++
+ if [[ -z "$simpleperf_dir" ]]; then
+-  echo "simpleperf not found. Set ANDROID_NDK_HOME or install NDK under ~/Library/Android/sdk/ndk/." >&2
++  echo "simpleperf not found. Set ANDROID_NDK_HOME/ANDROID_NDK_ROOT or install an NDK under a standard SDK path (for example ~/Library/Android/sdk/ndk or ~/Android/Sdk/ndk)." >&2
+   exit 1
+ fi
+ 

@@ -1,0 +1,141 @@
+# Salvage of stale PR-review worktree pr-13014 (detached @ 34fd53f5f61, Mar 2026 triage)
+
+diff --git a/apps/android/README.md b/apps/android/README.md
+index c2ae5a2179b..ff760398b60 100644
+--- a/apps/android/README.md
++++ b/apps/android/README.md
+@@ -21,6 +21,8 @@ cd apps/android
+ 
+ `gradlew` auto-detects the Android SDK at `~/Library/Android/sdk` (macOS default) if `ANDROID_SDK_ROOT` / `ANDROID_HOME` are unset.
+ 
++On Linux and Windows, set `ANDROID_SDK_ROOT` (or `ANDROID_HOME`) before running Gradle, or create `local.properties` with `sdk.dir=/absolute/path/to/Android/Sdk`.
++
+ ## Connect / Pair
+ 
+ 1) Start the gateway (on your “master” machine):
+diff --git a/apps/android/app/src/main/java/ai/openclaw/android/gateway/DeviceIdentityStore.kt b/apps/android/app/src/main/java/ai/openclaw/android/gateway/DeviceIdentityStore.kt
+index ff651c6c17b..99c65014763 100644
+--- a/apps/android/app/src/main/java/ai/openclaw/android/gateway/DeviceIdentityStore.kt
++++ b/apps/android/app/src/main/java/ai/openclaw/android/gateway/DeviceIdentityStore.kt
+@@ -3,11 +3,7 @@ package ai.openclaw.android.gateway
+ import android.content.Context
+ import android.util.Base64
+ import java.io.File
+-import java.security.KeyFactory
+-import java.security.KeyPairGenerator
+ import java.security.MessageDigest
+-import java.security.Signature
+-import java.security.spec.PKCS8EncodedKeySpec
+ import kotlinx.serialization.Serializable
+ import kotlinx.serialization.json.Json
+ 
+@@ -21,7 +17,9 @@ data class DeviceIdentity(
+ 
+ class DeviceIdentityStore(context: Context) {
+   private val json = Json { ignoreUnknownKeys = true }
+-  private val identityFile = File(context.filesDir, "openclaw/identity/device.json")
++  // Never auto-back up the node identity. Restores would clone the signing key across devices.
++  private val identityFile = File(context.noBackupFilesDir, "openclaw/identity/device.json")
++  private val legacyIdentityFile = File(context.filesDir, "openclaw/identity/device.json")
+ 
+   @Synchronized
+   fun loadOrCreate(): DeviceIdentity {
+@@ -30,8 +28,9 @@ class DeviceIdentityStore(context: Context) {
+       val derived = deriveDeviceId(existing.publicKeyRawBase64)
+       if (derived != null && derived != existing.deviceId) {
+         val updated = existing.copy(deviceId = derived)
+-        save(updated)
+-        return updated
++        if (save(updated)) {
++          return updated
++        }
+       }
+       return existing
+     }
+@@ -91,7 +90,12 @@ class DeviceIdentityStore(context: Context) {
+   }
+ 
+   private fun load(): DeviceIdentity? {
+-    return readIdentity(identityFile)
++    readIdentity(identityFile)?.let { return it }
++    val legacy = readIdentity(legacyIdentityFile) ?: return null
++    if (save(legacy)) {
++      return legacy
++    }
++    return legacy
+   }
+ 
+   private fun readIdentity(file: File): DeviceIdentity? {
+@@ -112,13 +116,17 @@ class DeviceIdentityStore(context: Context) {
+     }
+   }
+ 
+-  private fun save(identity: DeviceIdentity) {
+-    try {
++  private fun save(identity: DeviceIdentity): Boolean {
++    return try {
+       identityFile.parentFile?.mkdirs()
+       val encoded = json.encodeToString(DeviceIdentity.serializer(), identity)
+       identityFile.writeText(encoded, Charsets.UTF_8)
++      if (legacyIdentityFile != identityFile && legacyIdentityFile.exists()) {
++        legacyIdentityFile.delete()
++      }
++      true
+     } catch (_: Throwable) {
+-      // best-effort only
++      false
+     }
+   }
+ 
+@@ -151,15 +159,6 @@ class DeviceIdentityStore(context: Context) {
+     }
+   }
+ 
+-  private fun stripSpkiPrefix(spki: ByteArray): ByteArray {
+-    if (spki.size == ED25519_SPKI_PREFIX.size + 32 &&
+-      spki.copyOfRange(0, ED25519_SPKI_PREFIX.size).contentEquals(ED25519_SPKI_PREFIX)
+-    ) {
+-      return spki.copyOfRange(ED25519_SPKI_PREFIX.size, spki.size)
+-    }
+-    return spki
+-  }
+-
+   private fun sha256Hex(data: ByteArray): String {
+     val digest = MessageDigest.getInstance("SHA-256").digest(data)
+     val out = StringBuilder(digest.size * 2)
+@@ -173,10 +172,4 @@ class DeviceIdentityStore(context: Context) {
+     return Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+   }
+ 
+-  companion object {
+-    private val ED25519_SPKI_PREFIX =
+-      byteArrayOf(
+-        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+-      )
+-  }
+ }
+diff --git a/apps/android/app/src/main/res/xml/backup_rules.xml b/apps/android/app/src/main/res/xml/backup_rules.xml
+index 21e592ca47a..8f2eda0756f 100644
+--- a/apps/android/app/src/main/res/xml/backup_rules.xml
++++ b/apps/android/app/src/main/res/xml/backup_rules.xml
+@@ -1,4 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <full-backup-content>
+   <include domain="file" path="." />
++  <exclude domain="file" path="openclaw/identity/" />
+ </full-backup-content>
+diff --git a/apps/android/app/src/main/res/xml/data_extraction_rules.xml b/apps/android/app/src/main/res/xml/data_extraction_rules.xml
+index 46e58c54eb0..ac61ed5f6e2 100644
+--- a/apps/android/app/src/main/res/xml/data_extraction_rules.xml
++++ b/apps/android/app/src/main/res/xml/data_extraction_rules.xml
+@@ -2,8 +2,10 @@
+ <data-extraction-rules>
+   <cloud-backup>
+     <include domain="file" path="." />
++    <exclude domain="file" path="openclaw/identity/" />
+   </cloud-backup>
+   <device-transfer>
+     <include domain="file" path="." />
++    <exclude domain="file" path="openclaw/identity/" />
+   </device-transfer>
+ </data-extraction-rules>
